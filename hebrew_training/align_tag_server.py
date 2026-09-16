@@ -52,10 +52,14 @@ LOCK = threading.Lock()
 STORE = None
 CLAIMS = None
 BLOCK = 10  # clips a person holds at once; refilled as they work
-STALE_SECONDS = (
-    24 * 3600
-)  # an unmarked claim this old goes back in the pool, so a person
-#                            who opens the page and wanders off does not strand their share
+# A claim nobody has finished can go back in the pool, so a person who opens the page and
+# wanders off does not strand their share -- but how long it gets to sit depends on whether
+# anyone actually did anything with it. A claim that was never saved to is dead weight and
+# goes stale fast; one with real work in progress gets a much longer grace period so a slow
+# or interrupted annotator does not lose their seat to someone else mid-clip. A claim marked
+# `done` is never reclaimed by either clock -- see assign().
+NEVER_TOUCHED_STALE_SECONDS = 12 * 3600
+TOUCHED_STALE_SECONDS = 36 * 3600
 
 
 def parse_args() -> argparse.Namespace:
@@ -489,6 +493,7 @@ class PostgresStore:
                 "  clip_key   TEXT NOT NULL,"
                 "  annotator  TEXT NOT NULL,"
                 "  claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+                "  touched_at TIMESTAMPTZ,"
                 "  done       BOOLEAN NOT NULL DEFAULT false,"
                 "  PRIMARY KEY (dataset, clip_key))"
             )
@@ -497,16 +502,25 @@ class PostgresStore:
             "SELECT column_name FROM information_schema.columns"
             " WHERE table_name = 'claims' AND column_name = 'dataset'"
         ).fetchone()
-        if has_dataset is not None:
+        if has_dataset is None:
+            # Pre-dates multi-dataset serving. Nothing is lost rebuilding it in place if
+            # it is empty; if it is not, a person needs to confirm the migration first --
+            # same gate as the marks blob migration below.
+            if conn.execute("SELECT count(*) FROM claims").fetchone()[0] == 0:
+                conn.execute("DROP TABLE claims")
+                self._ensure_claims_table(conn)
+            else:
+                self.pending_migration = True
             return
-        # Pre-dates multi-dataset serving. Nothing is lost rebuilding it in place if it
-        # is empty; if it is not, a person needs to confirm the migration first -- same
-        # gate as the marks blob migration below.
-        if conn.execute("SELECT count(*) FROM claims").fetchone()[0] == 0:
-            conn.execute("DROP TABLE claims")
-            self._ensure_claims_table(conn)
-        else:
-            self.pending_migration = True
+        # Additive and nullable, so no migration gate is needed: a claim from before
+        # touch-tracking existed just reads back as "never touched" until its owner
+        # saves again, which is the same as the truth.
+        has_touched = conn.execute(
+            "SELECT column_name FROM information_schema.columns"
+            " WHERE table_name = 'claims' AND column_name = 'touched_at'"
+        ).fetchone()
+        if has_touched is None:
+            conn.execute("ALTER TABLE claims ADD COLUMN touched_at TIMESTAMPTZ")
 
     def _ensure_marks_table(self, conn) -> None:
         # marks: one row per (dataset, annotator, clip), so a save only rewrites the clip
@@ -556,36 +570,70 @@ class PostgresStore:
             return {}
         return index_rows([r[0] for r in rows], clips)
 
-    def claims(self) -> dict[str, tuple[str, float]]:
+    def claims(self) -> dict[str, tuple[str, float, float | None, bool]]:
+        """clip_key -> (annotator, claimed_at, touched_at, done). `touched_at` is None
+        for a claim nobody has ever saved to."""
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT clip_key, annotator, EXTRACT(EPOCH FROM claimed_at) FROM claims"
-                " WHERE dataset = %s",
+                "SELECT clip_key, annotator, EXTRACT(EPOCH FROM claimed_at),"
+                "       EXTRACT(EPOCH FROM touched_at), done"
+                "  FROM claims WHERE dataset = %s",
                 (self.dataset,),
             ).fetchall()
-        return {r[0]: (r[1], float(r[2])) for r in rows}
+        return {
+            r[0]: (r[1], float(r[2]), float(r[3]) if r[3] is not None else None, r[4])
+            for r in rows
+        }
 
-    def claim(self, who: str, keys: list[str]) -> None:
+    def claim(self, who: str, keys: list[str]) -> set[str]:
         """Take these clips for `who`, skipping any another annotator still holds.
 
         ON CONFLICT is what makes this safe: two people refilling at the same instant race
         for the same row, and the loser takes none of it rather than both walking away
         believing they own the clip. A claim is only stealable once it has gone stale
-        without being marked.
+        without being finished -- and never once it is `done`, at any age.
+
+        Returns the keys actually taken. The caller must not assume ownership of a key
+        this WHERE clause silently refused (still fresh, or already done) -- that
+        mismatch between what was asked for and what the database actually granted is
+        exactly the bug this return value exists to prevent.
         """
         if not keys:
-            return
-        cutoff = time.time() - STALE_SECONDS
+            return set()
+        now = time.time()
+        never_cutoff = now - NEVER_TOUCHED_STALE_SECONDS
+        touched_cutoff = now - TOUCHED_STALE_SECONDS
+        taken = set()
         with self.connect() as conn:
             for key in keys:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO claims (dataset, clip_key, annotator) VALUES (%s, %s, %s)"
                     " ON CONFLICT (dataset, clip_key) DO UPDATE"
-                    "   SET annotator = EXCLUDED.annotator, claimed_at = now(), done = false"
+                    "   SET annotator = EXCLUDED.annotator, claimed_at = now(),"
+                    "       touched_at = NULL, done = false"
                     " WHERE claims.annotator = %s"
-                    "    OR (claims.done = false AND claims.claimed_at < to_timestamp(%s))",
-                    (self.dataset, key, who, who, cutoff),
+                    "    OR (claims.done = false AND ("
+                    "         (claims.touched_at IS NULL"
+                    "          AND claims.claimed_at < to_timestamp(%s))"
+                    "      OR (claims.touched_at IS NOT NULL"
+                    "          AND claims.touched_at < to_timestamp(%s))"
+                    "    ))",
+                    (self.dataset, key, who, who, never_cutoff, touched_cutoff),
                 )
+                if cur.rowcount:
+                    taken.add(key)
+        return taken
+
+    def touch(self, who: str, key: str) -> None:
+        """Record that `who` actually saved this clip just now. Resets the 36h grace
+        clock so someone mid-way through a clip does not lose it to a reclaim just
+        because they are working slowly."""
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE claims SET touched_at = now()"
+                " WHERE dataset = %s AND clip_key = %s AND annotator = %s",
+                (self.dataset, key, who),
+            )
 
     def finish(self, who: str, key: str) -> None:
         """Mark a claim done, so it is never handed to anyone else."""
@@ -803,22 +851,55 @@ class FileClaims:
         except json.JSONDecodeError:
             return {}
 
-    def claims(self) -> dict[str, tuple[str, float]]:
-        return {k: (v["annotator"], v["claimed_at"]) for k, v in self.read().items()}
+    def claims(self) -> dict[str, tuple[str, float, float | None, bool]]:
+        """clip_key -> (annotator, claimed_at, touched_at, done). `touched_at` is None
+        for a claim nobody has ever saved to."""
+        return {
+            k: (v["annotator"], v["claimed_at"], v.get("touched_at"), v.get("done", False))
+            for k, v in self.read().items()
+        }
 
-    def claim(self, who: str, keys: list[str]) -> None:
+    def claim(self, who: str, keys: list[str]) -> set[str]:
+        """Take these clips for `who`. Returns the keys actually taken -- see
+        PostgresStore.claim for why the caller must not assume the rest."""
         if not keys:
-            return
-        cutoff = time.time() - STALE_SECONDS
+            return set()
+        now = time.time()
         rows = self.read()
+        taken = set()
         for key in keys:
             held = rows.get(key)
             if held and held["annotator"] != who:
-                if held.get("done") or held["claimed_at"] >= cutoff:
+                if held.get("done"):
                     continue
-            rows[key] = {"annotator": who, "claimed_at": time.time(), "done": False}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+                touched_at = held.get("touched_at")
+                cutoff = (
+                    touched_at + TOUCHED_STALE_SECONDS
+                    if touched_at is not None
+                    else held["claimed_at"] + NEVER_TOUCHED_STALE_SECONDS
+                )
+                if now < cutoff:
+                    continue
+            rows[key] = {
+                "annotator": who,
+                "claimed_at": now,
+                "touched_at": None,
+                "done": False,
+            }
+            taken.add(key)
+        if taken:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+        return taken
+
+    def touch(self, who: str, key: str) -> None:
+        """Record that `who` actually saved this clip just now, resetting the 36h grace
+        clock (see PostgresStore.touch)."""
+        rows = self.read()
+        if key in rows and rows[key]["annotator"] == who:
+            rows[key]["touched_at"] = time.time()
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
 
     def finish(self, who: str, key: str) -> None:
         rows = self.read()
@@ -859,7 +940,7 @@ def assign(claimer, who: str, clips: list[dict], marked: set[int]) -> set[int]:
     valuable unclaimed clip next regardless of who asks.
     """
     held = claimer.claims()
-    cutoff = time.time() - STALE_SECONDS
+    now = time.time()
     # Work you have already marked is yours whatever the claim table says. Claims can be
     # absent for marks that arrived another way -- imported from a local session, say --
     # and dropping them from your list would look like the work had been lost.
@@ -871,15 +952,31 @@ def assign(claimer, who: str, clips: list[dict], marked: set[int]) -> set[int]:
             continue  # already yours; never offer it as fresh work
         if owner is None:
             free.append((index, key))
-        elif owner[0] == who:
-            mine.add(index)
-        elif owner[1] < cutoff and index not in marked:
+            continue
+        owner_who, claimed_at, touched_at, done = owner
+        if owner_who == who:
+            mine.add(index)  # yours regardless of age -- you do not steal from yourself
+            continue
+        if done:
+            continue  # someone finished this; it is never handed to anyone else, at any age
+        # Untouched work is dead weight fast; work someone actually saved to gets a much
+        # longer grace period before it is offered up as free again.
+        cutoff = (
+            touched_at + TOUCHED_STALE_SECONDS
+            if touched_at is not None
+            else claimed_at + NEVER_TOUCHED_STALE_SECONDS
+        )
+        if now > cutoff:
             free.append((index, key))
     outstanding = len(mine - marked)
     if outstanding < BLOCK and free:
         take = free[: BLOCK - outstanding]
-        claimer.claim(who, [key for _, key in take])
-        mine.update(index for index, _ in take)
+        # claim() tells us what it actually granted -- a key it refused (because the SQL/
+        # file guard saw it was no longer stale, or done, by the time we got there) must
+        # not be added to `mine`, or this session would believe it owns a clip whose real
+        # claim row still belongs to someone else. That mismatch was the original bug.
+        taken = claimer.claim(who, [key for _, key in take])
+        mine.update(index for index, key in take if key in taken)
     return mine
 
 
@@ -1268,11 +1365,18 @@ def make_handler(args, dataset: Dataset, clips):
                     mine = load_saved(path, clips)
                     mine[index] = body["words"]
                     write_gold(path, clips, mine)
-                # "save" alone is a checkpoint for a clip still being worked on; only
-                # "done & next" (or its shortcuts) should retire the claim, so it is
-                # never handed to someone else while the annotator is mid-edit.
-                if CLAIMS is not None and body.get("next"):
-                    CLAIMS.finish(who, clip_key(clips[index]))
+                if CLAIMS is not None:
+                    # Every save -- not just "done & next" -- proves someone is actually
+                    # working this clip, so it resets the 36h grace clock rather than the
+                    # 12h one. Without this, a clip worked on for hours but not yet
+                    # finished would go stale on the same short clock as one nobody ever
+                    # opened.
+                    CLAIMS.touch(who, clip_key(clips[index]))
+                    # "save" alone is a checkpoint for a clip still being worked on; only
+                    # "done & next" (or its shortcuts) should retire the claim, so it is
+                    # never handed to someone else while the annotator is mid-edit.
+                    if body.get("next"):
+                        CLAIMS.finish(who, clip_key(clips[index]))
             return self.send(200, b'{"ok":true}', "application/json")
 
     return Handler
