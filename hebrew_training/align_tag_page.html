@@ -209,6 +209,7 @@
   <button id="setb" title="F">put mark at playhead</button>
   <button id="m5" title="Ctrl+Shift+&larr;">&minus;5ms</button><button id="p5" title="Ctrl+Shift+&rarr;">+5ms</button>
   <div class="sep"></div>
+  <button id="addwb">+ add word before</button>
   <button id="addw">+ add word after</button>
   <button id="delw" class="danger">&times; delete word</button>
   <div class="sep"></div>
@@ -302,8 +303,10 @@ the waveform (click, or drag the red playhead), then:</p>
 
 <h3>Correcting the transcript</h3>
 <p><b>Wrong word?</b> Double-click it to retype, or clear the box to delete it. Use
-<b>+ add word after</b> for one the transcript missed. <b>Corrected</b> words keep the original
-and are outlined amber; <b>added</b> ones are outlined green. Both are preserved in the export.</p>
+<b>+ add word before</b> or <b>+ add word after</b> for one the transcript missed &mdash; the new
+word starts selected as "?" so you can type straight over it. <b>Corrected</b> words keep the
+original and are outlined amber; <b>added</b> ones are outlined green. Both are preserved in the
+export.</p>
 
 <h3>Word boundaries &amp; overlaps</h3>
 <p><b>Double-click</b> the <b>start</b> or <b>end</b> label in the info bar (or the buttons) to
@@ -1326,7 +1329,7 @@ function shiftTouched(set,at,by){
 }
 
 // A word the ASR missed entirely. Added after the currently selected word.
-function addWord(){
+async function addWord(){
   if(!gold||!gold.length) return;
   const MIN_LEN=0.020;    // 20ms minimal word length
   const TARGET_LEN=0.500; // 500ms target length if space permits
@@ -1389,7 +1392,83 @@ function addWord(){
   buildWords();
   render();
   draw();
-  save();
+  // Await the save before opening the editor: save()'s completion calls render(), and
+  // render() rebuilds every chip from scratch whenever one is detached (which the editor's
+  // input-for-span swap does). Editing before that render lands means the rebuild replaces
+  // the freshly-focused input with a plain span out from under the user's cursor.
+  await save();
+  editWord(wi,chips[wi]);        // straight into typing; a word called "?" helps nobody
+}
+
+// Same as addWord, mirrored backwards: inserted before the currently selected word,
+// stealing space from whatever precedes it instead of whatever follows it.
+async function addWordBefore(){
+  if(!gold||!gold.length) return;
+  const MIN_LEN=0.020;    // 20ms minimal word length
+  const TARGET_LEN=0.500; // 500ms target length if space permits
+  const minAudio=tmin();
+
+  const cur=gold[wi];
+  const prev=(wi-1>=0)?gold[wi-1]:null;
+  const newEnd=cur.start;
+
+  let space=prev?(newEnd-prev.end):(newEnd-minAudio);
+  let newStart;
+  let pushed=false;
+
+  if(prev){
+    if(space>=TARGET_LEN){
+      newStart=newEnd-TARGET_LEN;
+    }else if(space>=MIN_LEN){
+      newStart=prev.end;
+    }else{
+      newStart=newEnd-MIN_LEN;
+      prev.end=newStart;
+      pushed=true;
+    }
+  }else{
+    newStart=Math.max(newEnd-TARGET_LEN,minAudio);
+  }
+
+  if(newStart<minAudio) newStart=minAudio;
+  if(newStart>newEnd) newStart=newEnd;
+
+  const newWord={word:'?',start:newStart,end:newEnd,added:true};
+  const insertIndex=wi;
+  gold.splice(insertIndex,0,newWord);
+  touched=shiftTouched(touched,insertIndex,1);
+  touched.add(insertIndex);
+
+  if(pushed){
+    for(let k=insertIndex-1;k>=0;k--){
+      if(gold[k].start<minAudio) gold[k].start=minAudio;
+      if(gold[k].end-gold[k].start<MIN_LEN){
+        gold[k].start=gold[k].end-MIN_LEN;
+      }
+      if(gold[k].start<minAudio) gold[k].start=minAudio;
+
+      touched.add(k);
+
+      if(k>0){
+        if(gold[k-1].end>gold[k].start){
+          gold[k-1].end=gold[k].start;
+        }else{
+          break;
+        }
+      }
+    }
+  }
+
+  wi=insertIndex;
+  fitWord();
+  buildWords();
+  render();
+  draw();
+  // Await the save before opening the editor: save()'s completion calls render(), and
+  // render() rebuilds every chip from scratch whenever one is detached (which the editor's
+  // input-for-span swap does). Editing before that render lands means the rebuild replaces
+  // the freshly-focused input with a plain span out from under the user's cursor.
+  await save();
   editWord(wi,chips[wi]);        // straight into typing; a word called "?" helps nobody
 }
 
@@ -1794,7 +1873,7 @@ $('m5').onclick=()=>nudgeWithSnap(-0.005); $('p5').onclick=()=>nudgeWithSnap(+0.
 $('fit').onclick=()=>{fitWord();draw();};
 $('fitall').onclick=()=>{view=[Math.max(tmin(),gold[0].start-0.2),
   Math.min(total(),gold[gold.length-1].end+0.2)];draw();};
-$('addw').onclick=addWord; $('delw').onclick=delWord;
+$('addwb').onclick=addWordBefore; $('addw').onclick=addWord; $('delw').onclick=delWord;
 $('untangleBtn').onclick=untangleWords;
 $('resetBaselineBtn').onclick=resetToBaseline;
 $('prevw').onclick=()=>goWord(wi-1); $('nextw').onclick=()=>goWord(wi+1);
