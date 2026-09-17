@@ -120,9 +120,49 @@
    text-align:center;padding:8px;cursor:pointer;transition:border-color .15s,background .15s}
  .dropzone small{color:#6f757f;font-size:11px;margin-top:2px}
  .dropzone.dragover{border-color:#3d6fd6;background:#1c2330;color:#c8ccd4}
- .dropzone.loaded{border-color:#4ec98a;color:#a8e6c4;border-style:solid}
- #sampleErr{color:#e06c6c;font-size:12px;min-height:16px;margin-top:4px}
-</style>
+  .dropzone.loaded{border-color:#4ec98a;color:#a8e6c4;border-style:solid}
+  #sampleErr{color:#e06c6c;font-size:12px;min-height:16px;margin-top:4px}
+  #overviewLink, #taggingLink{color:#6aa0ff;text-decoration:none;font-size:13px;font-weight:500;cursor:pointer}
+  #overviewLink:hover, #taggingLink:hover{text-decoration:underline;color:#8cb7ff}
+  #overviewLink.cur{color:#fff;font-weight:bold;text-decoration:underline}
+  #overviewScreen{display:none;gap:20px;margin-top:14px;min-height:calc(100vh - 80px)}
+  #overviewScreen.on{display:flex}
+  @media (max-width:960px){#overviewScreen{flex-direction:column-reverse}}
+  #ovLeft{flex:1;min-width:0;display:flex;flex-direction:column;gap:12px}
+  #ovRight{width:330px;flex-shrink:0;display:flex;flex-direction:column;gap:14px}
+  .ovCard{background:#1c1f25;border-radius:8px;padding:16px;border:1px solid #2a2e37}
+  .ovCard h2{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:#9aa0aa;margin:0 0 12px}
+  .statGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .statBox{background:#14161a;border-radius:6px;padding:10px 12px;border:1px solid #252932}
+  .statLabel{color:#8a8f98;font-size:11px;text-transform:uppercase;margin-bottom:4px}
+  .statVal{font-size:20px;font-weight:700;color:#e8e8ea;font-variant-numeric:tabular-nums}
+  .statSub{font-size:11px;color:#6f757f;margin-top:2px}
+  .ovToolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;background:#1c1f25;padding:10px 14px;border-radius:8px;border:1px solid #2a2e37}
+  .ovToolbar select, .ovToolbar input{background:#14161a;color:#e8e8ea;border:1px solid #333842;border-radius:6px;padding:6px 10px;font-size:13px}
+  .ovToolbar select:focus, .ovToolbar input:focus{outline:1px solid #3d6fd6}
+  .ovCount{color:#8a8f98;font-size:12px;margin-left:auto}
+  .ovList{display:flex;flex-direction:column;gap:6px;max-height:calc(100vh - 160px);overflow-y:auto;padding-right:4px}
+  .ovRow{display:flex;align-items:center;gap:10px;background:#1c1f25;border-radius:6px;padding:8px 12px;border:1px solid #252932;transition:background .12s,border-color .12s}
+  .ovRow:hover{background:#22262e;border-color:#3a3f4a}
+  .ovRow.isMe{border-left:3px solid #3d6fd6}
+  .ovIdx{color:#6f757f;font-size:12px;min-width:28px}
+  .ovId{font-family:monospace;font-size:11px;color:#8a8f98;cursor:pointer}
+  .ovText{flex:1;min-width:0;direction:rtl;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;color:#e8e8ea;unicode-bidi:plaintext}
+  .ovDur{font-size:12px;color:#8a8f98;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .ovStatus{display:inline-flex;align-items:center;gap:4px;font-size:11px;white-space:nowrap}
+  .ovActions{display:inline-flex;gap:6px;align-items:center}
+  .ovActions button{padding:4px 8px;font-size:12px}
+  .btnClaim{background:#2b6b46;border-color:#2b6b46;color:#fff;font-weight:600}
+  .btnClaim:hover{background:#358055}
+  .btnEdit{background:#3d6fd6;border-color:#3d6fd6;color:#fff;font-weight:600}
+  .btnEdit:hover{background:#5580e0}
+  .btnView{background:#2a2e37;color:#c8ccd4}
+  .btnView:hover{background:#363c47}
+  #readOnlyBanner{background:#1e2430;border:1px solid #3d6fd6;border-radius:8px;padding:9px 14px;margin:8px 0;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  #readOnlyTitle{font-weight:600;color:#6aa0ff;font-size:13px}
+  .roMarksSelect{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#8a8f98}
+  .roMarksSelect select{padding:4px 8px;font-size:12px}
+ </style>
 
 <div id="gate"><div class="card">
   <h2>Hebrew alignment tagging</h2>
@@ -151,9 +191,92 @@
   <button id="savedClose">close</button>
 </div></div>
 <div class="top"><h1>Hebrew alignment tagging</h1><div id="bar"></div><div id="me"></div>
+  <span id="navLinks" style="display:inline-flex;gap:12px;align-items:center">
+    <a id="overviewLink" href="#">overview</a>
+    <a id="taggingLink" href="#" style="display:none">back to tagging</a>
+  </span>
   <span id="sampleBadge" style="display:none">viewing local sample</span>
   <button id="uploadSampleBtn" title="Load a local CSV + WAV pair for viewing, no server involved">upload sample</button>
   <button id="removeSampleBtn" style="display:none">remove sample</button>
+</div>
+
+<div id="overviewScreen">
+  <div id="ovLeft">
+    <div class="ovToolbar">
+      <label class="tag">Status:</label>
+      <select id="ovFilterDone">
+        <option value="all">All clips</option>
+        <option value="done">Done</option>
+        <option value="not_done">Not done</option>
+      </select>
+      <div class="sep"></div>
+      <label class="tag">Claimant:</label>
+      <select id="ovFilterUser">
+        <option value="all">All claimants</option>
+        <option value="unclaimed">Unclaimed</option>
+      </select>
+      <div class="sep"></div>
+      <label class="tag">Sort:</label>
+      <select id="ovSort">
+        <option value="default">Default order</option>
+        <option value="dur_asc">Duration (shortest first)</option>
+        <option value="dur_desc">Duration (longest first)</option>
+      </select>
+      <div class="sep"></div>
+      <input id="ovSearch" placeholder="Search text or clip ID..." autocomplete="off">
+      <span id="ovCount" class="ovCount"></span>
+    </div>
+    <div class="ovList" id="ovList"></div>
+  </div>
+  <div id="ovRight">
+    <div class="ovCard">
+      <h2>Dataset Overview</h2>
+      <div style="color:#8a8f98;font-size:12px;margin-bottom:12px">Dataset: <b id="ovDatasetName" style="color:#e8e8ea">-</b></div>
+      <div class="statGrid">
+        <div class="statBox">
+          <div class="statLabel">Overall clips</div>
+          <div class="statVal" id="statOverallClips">-</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Overall minutes</div>
+          <div class="statVal" id="statOverallMin">-</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Saved clips</div>
+          <div class="statVal" id="statSavedClips">-</div>
+          <div class="statSub" id="statSavedPct"></div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Saved minutes</div>
+          <div class="statVal" id="statSavedMin">-</div>
+          <div class="statSub" id="statSavedMinPct"></div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Done clips</div>
+          <div class="statVal" id="statDoneClips" style="color:#4ec98a">-</div>
+          <div class="statSub" id="statDonePct"></div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Done minutes</div>
+          <div class="statVal" id="statDoneMin" style="color:#4ec98a">-</div>
+          <div class="statSub" id="statDoneMinPct"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="workspace">
+<div id="readOnlyBanner" style="display:none">
+  <span id="readOnlyTitle">Read-only view</span>
+  <span id="readOnlyClaimInfo" class="pill" style="color:#8a8f98"></span>
+  <div class="roMarksSelect">
+    <span>Marks:</span>
+    <select id="roMarksSelect"></select>
+  </div>
+  <button id="roClaimBtn" class="btnClaim" style="display:none">Claim this clip</button>
+  <button id="roEditBtn" class="btnEdit" style="display:none">Switch to edit mode</button>
+  <button id="roBackOvBtn" style="margin-left:auto">Back to overview</button>
 </div>
 
 <div id="sampleUpload" style="display:none">
@@ -335,9 +458,10 @@ fewer lines) and <b>min gap</b> if they do not match the speech.</p>
 <p><b>save</b> keeps a checkpoint of your current work; it is always safe mid-clip. Only
 <b>done &amp; next clip</b> marks the clip as finished (you can undo with <b>unmark as done</b>) and
 moves on. The top bar shows how many clips are <b>saved</b> vs <b>done</b>; click the saved count for
-the full list of your clips and their status. Reloading lands you back on the clip you last saved
+  the full list of your clips and their status. Reloading lands you back on the clip you last saved
 without marking done.</p>
 </div>
+</div><!-- #workspace -->
 
 <script>
 const PARAMS=new URLSearchParams(location.search);
@@ -346,11 +470,12 @@ let WHO=PARAMS.get('who')||localStorage.getItem('tagWho')||'';
 // Hosted, the token gates the whole server and `who` decides which file a save lands in,
 // so both have to ride along on every request.
 function api(path){
-  const q=new URLSearchParams();
-  if(TOK)q.set('t',TOK);
-  if(WHO)q.set('who',WHO);
+  const [base,qs]=path.split('?');
+  const q=new URLSearchParams(qs||'');
+  if(TOK && !q.has('t')) q.set('t',TOK);
+  if(WHO && !q.has('who')) q.set('who',WHO);
   const s=q.toString();
-  return s?path+'?'+s:path;
+  return s ? base+'?'+s : base;
 }
 let clips=[],ci=0,wi=0,edge='end',gold=[],touched=new Set();
 let sampleMode=false,sampleCsv=null,sampleWav=null,sampleBaseline=null;
@@ -371,6 +496,338 @@ const mmss=t=>{t=Math.max(0,t);return Math.floor(t/60)+':'+(t%60).toFixed(2).pad
 const NAME=/^[A-Za-z0-9_-]{1,32}$/;
 
 let ME=null;
+let isReadOnly=false, currentClipDetail=null, overviewData=null;
+
+function setUrlParam(key, val){
+  const u=new URL(location.href);
+  if(val!==null && val!==undefined) u.searchParams.set(key,val);
+  else u.searchParams.delete(key);
+  history.pushState(null,'',u.pathname+u.search);
+}
+
+async function showOverview(){
+  stop();
+  $('workspace').style.display='none';
+  $('overviewScreen').classList.add('on');
+  $('overviewLink').classList.add('cur');
+  $('taggingLink').style.display='';
+  setUrlParam('view','overview');
+  setUrlParam('clip',null);
+  await loadOverview();
+}
+
+async function loadOverview(){
+  try{
+    const r=await fetch(api('/api/overview'));
+    if(!r.ok){ alert('Failed to load overview ('+r.status+')'); return; }
+    overviewData=await r.json();
+    renderOverviewStats();
+    populateOverviewFilters();
+    renderOverviewList();
+  }catch(err){
+    console.error(err);
+  }
+}
+
+function renderOverviewStats(){
+  if(!overviewData||!overviewData.stats) return;
+  const s=overviewData.stats;
+  $('ovDatasetName').textContent=overviewData.dataset||'-';
+  $('statOverallClips').textContent=s.overall_clips;
+  $('statOverallMin').textContent=s.overall_minutes+'m';
+  $('statSavedClips').textContent=s.saved_clips;
+  const savedPct=s.overall_clips?Math.round((s.saved_clips/s.overall_clips)*100):0;
+  $('statSavedPct').textContent=savedPct+'% of overall';
+  $('statSavedMin').textContent=s.saved_minutes+'m';
+  const savedMinPct=s.overall_minutes?Math.round((s.saved_minutes/s.overall_minutes)*100):0;
+  $('statSavedMinPct').textContent=savedMinPct+'% of overall';
+  $('statDoneClips').textContent=s.done_clips;
+  const donePct=s.overall_clips?Math.round((s.done_clips/s.overall_clips)*100):0;
+  $('statDonePct').textContent=donePct+'% of overall';
+  $('statDoneMin').textContent=s.done_minutes+'m';
+  const doneMinPct=s.overall_minutes?Math.round((s.done_minutes/s.overall_minutes)*100):0;
+  $('statDoneMinPct').textContent=doneMinPct+'% of overall';
+}
+
+function populateOverviewFilters(){
+  const userSelect=$('ovFilterUser');
+  const prevVal=userSelect.value;
+  userSelect.innerHTML='<option value="all">All claimants</option><option value="unclaimed">Unclaimed</option>';
+  if(overviewData&&overviewData.annotators){
+    overviewData.annotators.forEach(u=>{
+      const opt=document.createElement('option');
+      opt.value=u;
+      opt.textContent=u+(u===WHO?' (you)':'');
+      userSelect.appendChild(opt);
+    });
+  }
+  userSelect.value=prevVal||'all';
+}
+
+function renderOverviewList(){
+  if(!overviewData||!overviewData.clips) return;
+  const doneFilter=$('ovFilterDone').value;
+  const userFilter=$('ovFilterUser').value;
+  const sortFilter=$('ovSort').value;
+  const searchFilter=($('ovSearch').value||'').trim().toLowerCase();
+
+  let filtered=overviewData.clips.filter(c=>{
+    if(doneFilter==='done' && !c.done) return false;
+    if(doneFilter==='not_done' && c.done) return false;
+    if(userFilter==='unclaimed' && c.claimant) return false;
+    if(userFilter!=='all' && userFilter!=='unclaimed' && c.claimant!==userFilter) return false;
+    if(searchFilter){
+      const matchId=c.id.toLowerCase().includes(searchFilter);
+      const matchText=(c.text||'').toLowerCase().includes(searchFilter);
+      if(!matchId && !matchText) return false;
+    }
+    return true;
+  });
+
+  if(sortFilter==='dur_asc'){
+    filtered.sort((a,b)=>a.duration-b.duration);
+  }else if(sortFilter==='dur_desc'){
+    filtered.sort((a,b)=>b.duration-a.duration);
+  }
+
+  $('ovCount').textContent='Showing '+filtered.length+' of '+overviewData.clips.length+' clips';
+
+  const list=$('ovList');
+  list.innerHTML='';
+  if(!filtered.length){
+    list.innerHTML='<div style="color:#8a8f98;padding:20px;text-align:center">No matching clips found</div>';
+    return;
+  }
+
+  filtered.forEach((c,idx)=>{
+    const row=document.createElement('div');
+    row.className='ovRow'+(c.claimed_by_me?' isMe':'');
+
+    const iSpan=document.createElement('span');
+    iSpan.className='ovIdx';
+    iSpan.textContent=(idx+1)+'.';
+
+    const idSpan=document.createElement('span');
+    idSpan.className='ovId';
+    idSpan.textContent=c.id.slice(0,8);
+    idSpan.title=c.id;
+
+    const textSpan=document.createElement('span');
+    textSpan.className='ovText';
+    textSpan.textContent=c.text||c.id;
+    textSpan.title=c.text||c.id;
+
+    const durSpan=document.createElement('span');
+    durSpan.className='ovDur';
+    durSpan.textContent=mmss(c.duration);
+
+    const statusSpan=document.createElement('span');
+    statusSpan.className='ovStatus';
+    if(c.done){
+      statusSpan.innerHTML='<span class="savedBadge done on">done</span>';
+    }else if(c.saved){
+      const whoList=c.saved_by&&c.saved_by.length?c.saved_by.join(', '):'';
+      statusSpan.innerHTML='<span class="savedBadge on" title="Saved by: '+(whoList||'yes')+'">saved</span>';
+    }
+    if(c.claimant){
+      const clPill=document.createElement('span');
+      clPill.className='savedBadge';
+      clPill.textContent=c.claimed_by_me?'claimed by you':c.claimant;
+      if(c.claimed_by_me) clPill.style.color='#6aa0ff';
+      statusSpan.appendChild(clPill);
+    }else{
+      const unPill=document.createElement('span');
+      unPill.className='savedBadge';
+      unPill.textContent='unclaimed';
+      statusSpan.appendChild(unPill);
+    }
+
+    const actDiv=document.createElement('div');
+    actDiv.className='ovActions';
+
+    if(c.claimed_by_me){
+      const editBtn=document.createElement('button');
+      editBtn.className='btnEdit';
+      editBtn.textContent='Edit';
+      editBtn.onclick=()=>openClip(c.id, false);
+
+      const viewBtn=document.createElement('button');
+      viewBtn.className='btnView';
+      viewBtn.textContent='View';
+      viewBtn.onclick=()=>openClip(c.id, true);
+
+      actDiv.append(editBtn, viewBtn);
+    }else{
+      if(c.claimable){
+        const claimBtn=document.createElement('button');
+        claimBtn.className='btnClaim';
+        claimBtn.textContent='Claim';
+        claimBtn.onclick=()=>claimClip(c.id);
+        actDiv.appendChild(claimBtn);
+      }
+      const viewBtn=document.createElement('button');
+      viewBtn.className='btnView';
+      viewBtn.textContent='View';
+      viewBtn.onclick=()=>openClip(c.id, true);
+      actDiv.appendChild(viewBtn);
+    }
+
+    row.append(iSpan, idSpan, textSpan, durSpan, statusSpan, actDiv);
+    list.appendChild(row);
+  });
+}
+
+async function claimClip(key){
+  try{
+    const r=await fetch(api('/api/claim'),{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key})
+    });
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok){
+      alert(j.error||'Failed to claim clip');
+      return;
+    }
+    await openClip(key, false);
+  }catch(err){
+    alert('Failed to claim clip: '+err);
+  }
+}
+
+async function openClip(key, forceReadOnly){
+  stop();
+  const r=await fetch(api('/api/clip-marks?key='+encodeURIComponent(key)));
+  if(!r.ok){
+    alert('Could not load clip ('+r.status+')');
+    return;
+  }
+  const data=await r.json();
+  currentClipDetail=data;
+
+  const isMine=Boolean(data.claim&&data.claim.claimed_by_me);
+  isReadOnly=(forceReadOnly || !isMine);
+
+  $('overviewScreen').classList.remove('on');
+  $('workspace').style.display='block';
+  $('overviewLink').classList.remove('cur');
+  $('taggingLink').style.display='';
+  setUrlParam('clip', key);
+  setUrlParam('view', null);
+
+  if(isReadOnly){
+    $('readOnlyBanner').style.display='flex';
+    let claimText='Unclaimed';
+    if(data.claim&&data.claim.claimant){
+      claimText='Claimed by '+(data.claim.claimed_by_me?'you':data.claim.claimant)
+        +(data.claim.done?' (done)':'');
+    }
+    $('readOnlyClaimInfo').textContent=claimText;
+
+    const select=$('roMarksSelect');
+    select.innerHTML='';
+    const baseOpt=document.createElement('option');
+    baseOpt.value='__baseline__';
+    baseOpt.textContent='Baseline (aligner)';
+    select.appendChild(baseOpt);
+
+    const markKeys=Object.keys(data.marks||{});
+    markKeys.forEach(ann=>{
+      const opt=document.createElement('option');
+      opt.value=ann;
+      opt.textContent=ann+(ann===WHO?' (your marks)':'');
+      select.appendChild(opt);
+    });
+
+    let defaultChoice='__baseline__';
+    if(data.claim&&data.claim.claimant&&data.marks&&data.marks[data.claim.claimant]){
+      defaultChoice=data.claim.claimant;
+    }else if(markKeys.length){
+      defaultChoice=markKeys[0];
+    }
+    select.value=defaultChoice;
+
+    select.onchange=()=>{
+      const choice=select.value;
+      let wordsToUse=data.words;
+      if(choice!=='__baseline__'&&data.marks&&data.marks[choice]){
+        wordsToUse=data.marks[choice];
+      }
+      gold=wordsToUse.map(w=>({word:w.word,start:w.start,end:w.end,was:w.was,added:w.added}));
+      touched=new Set();
+      buildWords();
+      draw();
+      render();
+    };
+
+    if(data.claim&&data.claim.claimable){
+      $('roClaimBtn').style.display='';
+      $('roClaimBtn').onclick=()=>claimClip(key);
+    }else{
+      $('roClaimBtn').style.display='none';
+    }
+
+    if(isMine){
+      $('roEditBtn').style.display='';
+      $('roEditBtn').onclick=()=>openClip(key, false);
+    }else{
+      $('roEditBtn').style.display='none';
+    }
+
+    $('roBackOvBtn').onclick=showOverview;
+    setClipActionsVisible(false);
+  }else{
+    $('readOnlyBanner').style.display='none';
+    setClipActionsVisible(true);
+  }
+
+  let existingIndex=clips.findIndex(x=>(x.key||x.id)===key);
+  let initialSaved=null;
+  if(isReadOnly){
+    const choice=$('roMarksSelect').value;
+    if(choice!=='__baseline__'&&data.marks&&data.marks[choice]){
+      initialSaved=data.marks[choice];
+    }
+  }else{
+    initialSaved=(data.marks&&data.marks[WHO])||data.words;
+  }
+
+  if(existingIndex<0){
+    clips.push({
+      id: data.id,
+      key: data.id,
+      metadata: data.metadata||{},
+      text: data.text,
+      duration: data.duration,
+      words: data.words,
+      labels: data.labels,
+      saved: initialSaved,
+      done: data.claim?data.claim.done:false,
+      isExternal: true
+    });
+    ci=clips.length-1;
+  }else{
+    ci=existingIndex;
+    if(initialSaved) clips[ci].saved=initialSaved;
+  }
+
+  await loadClip();
+}
+
+async function backToTagging(){
+  stop();
+  isReadOnly=false;
+  currentClipDetail=null;
+  $('readOnlyBanner').style.display='none';
+  $('overviewScreen').classList.remove('on');
+  $('workspace').style.display='block';
+  $('overviewLink').classList.remove('cur');
+  $('taggingLink').style.display='none';
+  setClipActionsVisible(true);
+  setUrlParam('view', null);
+  setUrlParam('clip', null);
+  await load();
+}
 
 async function boot(){
   ME=await (await fetch(api('/api/me'))).json();
@@ -455,6 +912,16 @@ function gate(authed){
 
 async function load(){
   clips=await (await fetch(api('/api/clips'))).json();
+  const v=PARAMS.get('view');
+  const cl=PARAMS.get('clip');
+  if(v==='overview'){
+    PARAMS.delete('view');
+    return showOverview();
+  }
+  if(cl){
+    PARAMS.delete('clip');
+    return openClip(cl);
+  }
   // Land on the clip last worked on but not finished: the most recent one the annotator
   // saved without marking done. Fall back to the first clip with no marks at all.
   ci=-1;
@@ -466,7 +933,8 @@ async function load(){
 async function loadClip(){
   stop();
   const c=clips[ci];
-  gold=(c.saved||c.words).map(w=>({word:w.word,start:w.start,end:w.end}));
+  if(!c) return;
+  gold=(c.saved||c.words).map(w=>({word:w.word,start:w.start,end:w.end,was:w.was,added:w.added}));
   touched=new Set(c.saved?gold.map((_,i)=>i):[]);
   wi=0; edge='end'; head=0;
   specCanvas=null; snapPoints=[];
@@ -488,7 +956,7 @@ const mark=()=>edge==='end'?gold[wi].end:gold[wi].start;
 // Whether a word actually differs from what the source clip carried. Compared against the
 // original aligner values rather than a "was touched" flag, so a mark dragged and dragged
 // back reads as unmodified again, and a saved clip only shows green where it really moved.
-const srcWord=i=>{const s=clips[ci].words;return (s&&s[i])||null;};
+const srcWord=i=>{const s=clips[ci]&&clips[ci].words;return (s&&s[i])||null;};
 const modified=i=>{
   const w=gold[i];
   if(w.added) return true;
@@ -1276,6 +1744,10 @@ $('words').addEventListener('mouseleave',hideGapBtn);
 function render(){
   if(sampleMode){
     $('bar').innerHTML='local sample &nbsp;·&nbsp; word '+(wi+1)+'/'+gold.length;
+  }else if(isReadOnly){
+    const c=clips[ci]||{};
+    $('bar').innerHTML='clip '+(c.id||(ci+1))+' &nbsp;·&nbsp; word '+(wi+1)+'/'+gold.length
+      +' &nbsp;·&nbsp; <span style="color:#6aa0ff;font-weight:600">view only</span>';
   }else{
     const savedN=clips.filter(x=>x.saved).length;
     const doneN=clips.filter(x=>x.done).length;
@@ -1283,7 +1755,7 @@ function render(){
       +' &nbsp;·&nbsp; <a id="savedLink" href="#" title="all clips assigned to you, with their status">'+savedN+' saved</a>'
       +' &nbsp;·&nbsp; <span id="done">'+doneN+' done</span>';
     const sl=$('savedLink'); if(sl) sl.onclick=e=>{e.preventDefault();showSaved();};
-    const un=$('unmark'); if(un) un.disabled=!clips[ci].done;
+    const un=$('unmark'); if(un) un.disabled=!(clips[ci]&&clips[ci].done);
   }
   if(chips.length!==gold.length || !chips.every(c=>c.parentNode)) buildWords();
   gold.forEach((wd,i)=>{const s=chips[i];
@@ -2098,7 +2570,7 @@ $('saveonly').onclick=save;
 $('save').onclick=saveNext;
 $('skip').onclick=()=>{if(ci<clips.length-1){ci++;loadClip();}};
 $('unmark').onclick=async ()=>{
-  if(sampleMode) return;
+  if(sampleMode||isReadOnly) return;
   await fetch(api('/api/unmark'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({key:clips[ci].key})});
   clips[ci].done=false;
@@ -2205,7 +2677,7 @@ $('removeSampleBtn').onclick=async ()=>{
 // Persist without advancing: a text correction is worth keeping the moment it is made,
 // even on a clip whose boundaries are not finished.
 async function save(){
-  if(sampleMode){ render(); return; }   // a local sample is view-only: never tag, never call the server
+  if(sampleMode||isReadOnly){ render(); return; }   // view-only: never tag, never call the server
   await fetch(api('/api/gold'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({index:ci,key:clips[ci].key,words:gold,next:false})});
   clips[ci].saved=gold.map(w=>({...w}));
@@ -2213,7 +2685,7 @@ async function save(){
 }
 
 async function saveNext(){
-  if(sampleMode){ render(); return; }
+  if(sampleMode||isReadOnly){ render(); return; }
   await fetch(api('/api/gold'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({index:ci,key:clips[ci].key,words:gold,next:true})});
   clips[ci].saved=gold.map(w=>({...w}));
@@ -2283,11 +2755,28 @@ addEventListener('keydown',async e=>{
   if(e.key==='ArrowLeft'){e.preventDefault();stepMark(-1);return;}
   if(e.key==='ArrowRight'){e.preventDefault();stepMark(1);return;}
   if(e.key==='f'){setMark(now());return;}
+  if(isReadOnly && (e.key==='Enter'||((e.ctrlKey||e.metaKey)&&e.key==='s'))){
+    e.preventDefault(); return;
+  }
   if(e.key==='Enter'){e.preventDefault();
     if(e.ctrlKey||e.metaKey) await saveNext(); else await save(); return;}
   if(e.key==='s'){if(e.ctrlKey||e.metaKey){e.preventDefault();await save();return;}
-    if(!sampleMode&&ci<clips.length-1){ci++;await loadClip();}return;}
+    if(!sampleMode&&!isReadOnly&&ci<clips.length-1){ci++;await loadClip();}return;}
 });
 addEventListener('resize',()=>{peaks=null;draw();});
+$('ovFilterDone').onchange=renderOverviewList;
+$('ovFilterUser').onchange=renderOverviewList;
+$('ovSort').onchange=renderOverviewList;
+$('ovSearch').oninput=renderOverviewList;
+$('overviewLink').onclick=e=>{ e.preventDefault(); showOverview(); };
+$('taggingLink').onclick=e=>{ e.preventDefault(); backToTagging(); };
+addEventListener('popstate',()=>{
+  const p=new URLSearchParams(location.search);
+  const v=p.get('view');
+  const c=p.get('clip');
+  if(v==='overview') showOverview();
+  else if(c) openClip(c);
+  else backToTagging();
+});
 boot();
 </script>

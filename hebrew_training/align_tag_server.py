@@ -783,6 +783,37 @@ class PostgresStore:
             ).fetchall()
         return [(r[0], r[1]) for r in rows]
 
+    def saved_by_clip(self) -> dict[str, list[str]]:
+        """clip_key -> list of annotators who saved marks for this dataset."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT clip_key, annotator FROM marks WHERE dataset = %s",
+                (self.dataset,),
+            ).fetchall()
+        out: dict[str, list[str]] = {}
+        for clip_key, annotator in rows:
+            out.setdefault(clip_key, []).append(annotator)
+        return out
+
+    def clip_marks(self, key: str) -> dict[str, list]:
+        """annotator -> words list for a specific clip key."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT annotator, payload FROM marks WHERE dataset = %s AND clip_key = %s",
+                (self.dataset, key),
+            ).fetchall()
+        out: dict[str, list] = {}
+        for annotator, payload in rows:
+            if isinstance(payload, dict) and "words" in payload:
+                out[annotator] = payload["words"]
+            elif isinstance(payload, str):
+                try:
+                    p = json.loads(payload)
+                    out[annotator] = p.get("words", [])
+                except Exception:
+                    pass
+        return out
+
     def progress(self) -> list[dict]:
         """Who has marked what in this dataset. With the tool open to more than one
         person there is otherwise no way to see that anyone has been working, or who."""
@@ -931,6 +962,71 @@ def clip_key(clip: dict) -> str:
     was built from the clip's file name and offset. A dataset row has an id already.
     """
     return clip["id"]
+
+
+def is_clip_claimable(
+    owner_info: tuple[str, float, float | None, bool] | None, now: float
+) -> bool:
+    """A clip is claimable if it was never claimed, or if unfinished and its claim expired."""
+    if owner_info is None:
+        return True
+    owner_who, claimed_at, touched_at, done = owner_info
+    if done:
+        return False
+    cutoff = (
+        touched_at + TOUCHED_STALE_SECONDS
+        if touched_at is not None
+        else claimed_at + NEVER_TOUCHED_STALE_SECONDS
+    )
+    return now > cutoff
+
+
+def get_saved_annotators_by_clip(
+    store: PostgresStore | None, out_dir: Path, dataset_name: str
+) -> dict[str, list[str]]:
+    """Returns clip_key -> [annotator1, annotator2, ...] for all saved marks in this dataset."""
+    by_clip: dict[str, list[str]] = {}
+    if store is not None:
+        return store.saved_by_clip()
+    if out_dir.exists():
+        for f in sorted(out_dir.glob("*.jsonl")):
+            if f.name.startswith("_"):
+                continue
+            annotator = f.stem
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    if "id" in row:
+                        by_clip.setdefault(row["id"], []).append(annotator)
+                except json.JSONDecodeError:
+                    continue
+    return by_clip
+
+
+def get_clip_annotator_marks(
+    store: PostgresStore | None, out_dir: Path, dataset_name: str, key: str
+) -> dict[str, list]:
+    """Returns {annotator: words} for a specific clip key."""
+    if store is not None:
+        return store.clip_marks(key)
+    out: dict[str, list] = {}
+    if out_dir.exists():
+        for f in sorted(out_dir.glob("*.jsonl")):
+            if f.name.startswith("_"):
+                continue
+            annotator = f.stem
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    if row.get("id") == key and "words" in row:
+                        out[annotator] = row["words"]
+                except json.JSONDecodeError:
+                    continue
+    return out
 
 
 def assign(claimer, who: str, clips: list[dict], marked: set[int]) -> set[int]:
@@ -1253,6 +1349,120 @@ def make_handler(args, dataset: Dataset, clips):
                     json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                     "application/json; charset=utf-8",
                 )
+            if route == "/api/overview":
+                who = self.who() or "anon"
+                held = CLAIMS.claims() if CLAIMS is not None else {}
+                saved_by_clip = get_saved_annotators_by_clip(STORE, args.out, dataset.name)
+                now = time.time()
+
+                annotators_set = set()
+                overall_duration = 0.0
+                saved_duration = 0.0
+                done_duration = 0.0
+                saved_count = 0
+                done_count = 0
+
+                clip_summaries = []
+                for clip in clips:
+                    ckey = clip_key(clip)
+                    owner_info = held.get(ckey)
+                    owner_who = owner_info[0] if owner_info else None
+                    done = bool(owner_info[3]) if owner_info else False
+                    saved_users = saved_by_clip.get(ckey, [])
+                    saved = done or bool(saved_users)
+
+                    if owner_who:
+                        annotators_set.add(owner_who)
+                    for u in saved_users:
+                        annotators_set.add(u)
+
+                    dur = float(clip["duration"])
+                    overall_duration += dur
+                    if saved:
+                        saved_count += 1
+                        saved_duration += dur
+                    if done:
+                        done_count += 1
+                        done_duration += dur
+
+                    claimable = is_clip_claimable(owner_info, now)
+                    claimed_by_me = (owner_who == who)
+
+                    clip_summaries.append(
+                        {
+                            "id": clip["id"],
+                            "text": clip["text"],
+                            "duration": round(dur, 2),
+                            "claimant": owner_who,
+                            "done": done,
+                            "saved": saved,
+                            "saved_by": saved_users,
+                            "claimable": claimable,
+                            "claimed_by_me": claimed_by_me,
+                        }
+                    )
+
+                body = {
+                    "dataset": dataset.name,
+                    "stats": {
+                        "overall_clips": len(clips),
+                        "saved_clips": saved_count,
+                        "done_clips": done_count,
+                        "overall_minutes": round(overall_duration / 60.0, 1),
+                        "saved_minutes": round(saved_duration / 60.0, 1),
+                        "done_minutes": round(done_duration / 60.0, 1),
+                    },
+                    "annotators": sorted(annotators_set),
+                    "clips": clip_summaries,
+                }
+                return self.send(
+                    200,
+                    json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
+            if route == "/api/clip-marks":
+                who = self.who() or "anon"
+                from urllib.parse import parse_qs
+
+                key = (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
+                clip = by_key.get(key)
+                if clip is None:
+                    try:
+                        clip = clips[int(key)]
+                    except (ValueError, IndexError):
+                        return self.send(
+                            404, b'{"error":"clip not found"}', "application/json"
+                        )
+                key = clip_key(clip)
+                held = CLAIMS.claims() if CLAIMS is not None else {}
+                owner_info = held.get(key)
+                owner_who = owner_info[0] if owner_info else None
+                done = bool(owner_info[3]) if owner_info else False
+                now = time.time()
+                claimable = is_clip_claimable(owner_info, now)
+                marks_by_annotator = get_clip_annotator_marks(
+                    STORE, args.out, dataset.name, key
+                )
+                body = {
+                    "id": clip["id"],
+                    "key": clip["id"],
+                    "text": clip["text"],
+                    "duration": clip["duration"],
+                    "words": clip["a"],
+                    "labels": clip["labels"],
+                    "marks": marks_by_annotator,
+                    "claim": {
+                        "claimant": owner_who,
+                        "done": done,
+                        "claimable": claimable,
+                        "claimed_by_me": (owner_who == who),
+                    },
+                }
+                return self.send(
+                    200,
+                    json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
             if route.startswith("/api/audio/"):
                 target = unquote(route[len("/api/audio/") :])
                 clip = by_key.get(target)
@@ -1327,6 +1537,30 @@ def make_handler(args, dataset: Dataset, clips):
                 )
             if args.auth and not self.who():
                 return self.send(401, b'{"error":"sign in"}', "application/json")
+            if route == "/api/claim":
+                who = self.who() or "anon"
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                key = body.get("key")
+                if not key or key not in by_key:
+                    return self.send(
+                        400, b'{"error":"unknown clip"}', "application/json"
+                    )
+                with LOCK:
+                    taken = CLAIMS.claim(who, [key])
+                if key in taken:
+                    return self.send(
+                        200,
+                        json.dumps({"ok": True, "key": key}).encode("utf-8"),
+                        "application/json",
+                    )
+                return self.send(
+                    409,
+                    json.dumps(
+                        {"error": "Clip is not available for claiming"}
+                    ).encode("utf-8"),
+                    "application/json",
+                )
             if route == "/api/unmark":
                 # "Unmark as done" pulls the clip's claim back into progress, so it shows
                 # up in the to-finish list again. Marks are untouched.
