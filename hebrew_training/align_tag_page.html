@@ -314,7 +314,9 @@ type an exact time &mdash; this may create overlaps. Use <b>untangle words</b> t
 words equally, or <b>reset to baseline</b> to restore the original dataset words and timings.</p>
 
 <h3>Using the waveform &amp; spectrogram</h3>
-<p>Drag a blue mark to move it; drag the middle of a word to slide the whole tag; drag any mark to
+<p>Drag a blue mark to move it; drag the middle of a word to slide the whole tag &mdash; sliding into
+a neighbouring word pushes it along (and its own neighbour, cascading) rather than overlapping
+or shrinking it. Drag any mark to
 make that word current. Click empty space to move the playhead, or drag the red playhead to scrub.
 <b>Wheel zooms</b>, <kbd>shift+wheel</kbd> scrolls, and the bar under the panel pans left and right.
 <b>fit word</b> snaps to the current word, <b>fit all words</b> shows the whole sentence.</p>
@@ -1631,6 +1633,30 @@ function pushStart(idx,t){
   }else t=Math.max(t,tmin());
   gold[idx].start=t; touched.add(idx);
 }
+// Dragging a whole word (both marks together, length fixed) is the same "push, don't clamp"
+// idea as pushEnd/pushStart, just simpler: since the dragged word's length never changes,
+// contact with a neighbour is just end>start (no flush check needed -- a real gap is consumed
+// first, and only once the edge actually reaches the neighbour does it start moving). The
+// cascade cannot run out of neighbours to push forever, so after cascading the whole chain
+// is pulled back inside [tmin(),total()] as one block if it ran past either edge -- that
+// includes the word being dragged, which is how the drag itself ends up clamped at the ends
+// of the clip instead of at the first neighbour it touches.
+function pushWord(idx){
+  for(let i=idx;i<gold.length-1;i++){
+    const delta=gold[i].end-gold[i+1].start;
+    if(delta<=1e-9) break;
+    gold[i+1].start+=delta; gold[i+1].end+=delta; touched.add(i+1);
+  }
+  for(let i=idx;i>0;i--){
+    const delta=gold[i-1].end-gold[i].start;
+    if(delta<=1e-9) break;
+    gold[i-1].start-=delta; gold[i-1].end-=delta; touched.add(i-1);
+  }
+  const over=gold[gold.length-1].end-total();
+  if(over>0) for(let i=idx;i<gold.length;i++){ gold[i].start-=over; gold[i].end-=over; }
+  const under=tmin()-gold[0].start;
+  if(under>0) for(let i=0;i<=idx;i++){ gold[i].start+=under; gold[i].end+=under; }
+}
 function setMark(t,which){
   which=which||edge;
   if(which==='start') pushStart(wi,t); else pushEnd(wi,t);
@@ -1703,10 +1729,10 @@ function attachZoomEvents(canvas){
             if(!moved){ if(Math.abs(ev.clientX-downX)<=3) return;
               moved=true; dragging=true; canvas.classList.add('grabbing'); }
             let a=at(ev.clientX)-grab;
-            const lo=(wi>0)?gold[wi-1].end:tmin();
-            const hi=(wi<gold.length-1)?gold[wi+1].start:total();
-            a=Math.max(lo,Math.min(a,hi-len));
-            w.start=a; w.end=a+len; touched.add(wi); draw(); render();
+            a=Math.max(tmin(),Math.min(a,total()-len));
+            w.start=a; w.end=a+len; touched.add(wi);
+            pushWord(wi);
+            draw(); render();
             if(loopKind){const sp=loopSpan(); start(sp[0],sp[1]);}
             else scheduleWordPlay();
           };
