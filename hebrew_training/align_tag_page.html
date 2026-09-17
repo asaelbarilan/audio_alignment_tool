@@ -97,6 +97,11 @@
  .w.cur{background:#3d6fd6;color:#fff;font-weight:600}
  .w.ok{background:#24503a;color:#bfe6cf}
  .w.playing{border:2px solid #d8a13a}
+ .wgap-add{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;
+   border-radius:50%;background:#3d6fd6;color:#fff;border:0;font:16px/20px system-ui;padding:0;
+   cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.4);animation:wgapIn .1s ease-out}
+ .wgap-add:hover{background:#5580e0}
+ @keyframes wgapIn{from{transform:scale(.4);opacity:0}to{transform:scale(1);opacity:1}}
  #cmp{margin:6px 0;font-variant-numeric:tabular-nums;font-size:13px}
  .pill{display:inline-block;padding:3px 10px;margin-right:8px;border-radius:5px;background:#252932}
 #hint{color:#767c86;margin-top:10px;line-height:1.9;font-size:12.5px}
@@ -656,6 +661,7 @@ function drawOverview(){
 // zoomed. It is refitted to the word whenever the word or clip changes, and nudged along by
 // ensureVisible when a mark is dragged past its edge.
 let view=null,dragging=false;
+let createDrag=null;   // {s,e} in-progress Ctrl+drag "create new word" span, in app time
 function fitWord(){
   if(!gold||!gold.length||!gold[wi]){ view=[tmin(), Math.max(tmin()+0.12, total())]; return; }
   view=[Math.max(tmin(),gold[wi].start-MARGIN), Math.min(total(),gold[wi].end+MARGIN)];
@@ -1007,6 +1013,15 @@ function drawWave(){
     });
   }
 
+  // in-progress Ctrl+drag "create word" span
+  if(createDrag){
+    const x0=X(createDrag.s), x1=X(createDrag.e);
+    wg.fillStyle='rgba(78,201,138,.28)';
+    wg.fillRect(Math.min(x0,x1),0,Math.max(1,Math.abs(x1-x0)),h);
+    wg.strokeStyle='#4ec98a'; wg.lineWidth=1;
+    wg.strokeRect(Math.min(x0,x1)+0.5,0.5,Math.max(1,Math.abs(x1-x0))-1,h-1);
+  }
+
   // playhead visible ONLY in top 20% of the bar
   const p=now();
   if(p>=lo&&p<=hi){
@@ -1057,6 +1072,15 @@ function drawZoom(){
     zg.fillRect(x0, yTop, wSpan, 1);
     zg.fillRect(x0, yTop + hSpan - 1, wSpan, 1);
   });
+
+  // 2b. In-progress Ctrl+drag "create word" span
+  if(createDrag){
+    const x0=X(createDrag.s), x1=X(createDrag.e);
+    zg.fillStyle='rgba(78,201,138,.28)';
+    zg.fillRect(Math.min(x0,x1),0,Math.max(1,Math.abs(x1-x0)),h);
+    zg.strokeStyle='#4ec98a'; zg.lineWidth=1;
+    zg.strokeRect(Math.min(x0,x1)+0.5,0.5,Math.max(1,Math.abs(x1-x0))-1,h-1);
+  }
 
   // 3. Time ticks at bottom
   zg.fillStyle='#2b303a';
@@ -1185,7 +1209,7 @@ function tick(){ if(playing)draw();
 // different element, so the browser never reports a double-click at all.
 let chips=[];
 function buildWords(){
-  const ws=$('words'); ws.innerHTML=''; chips=[]; playingIdx=-1;
+  const ws=$('words'); hideGapBtn(); ws.innerHTML=''; chips=[]; playingIdx=-1;
   gold.forEach((wd,i)=>{
     const s=document.createElement('span');
     s.dir='auto';
@@ -1195,6 +1219,59 @@ function buildWords(){
     ws.appendChild(s); chips.push(s);
   });
 }
+// idx is the array position to insert BEFORE (idx===gold.length means "after the last word").
+// Delegates to the existing addWordBefore/addWord so the space-stealing/push-neighbour
+// behaviour (and the "jump straight into typing" UX) stays identical everywhere.
+function insertWordAt(idx){
+  if(!gold||!gold.length) return;
+  if(idx>=gold.length){ wi=gold.length-1; addWord(); }
+  else{ wi=Math.max(0,idx); addWordBefore(); }
+}
+
+// No space is reserved between words at rest. Instead, hovering near a chip's edge (or
+// past the first/last chip -- the sentence's own edges) injects a real "+" flex item into
+// the row right at that boundary, which pushes the neighbouring words apart to make room;
+// moving away removes it and the words settle back together. The button is anchored off
+// whichever neighbouring chip's edge is closest, so once inserted it stays stable even
+// though the OTHER chip gets pushed away by its own width.
+let gapBtn=null, gapBtnIdx=null;
+const GAP_HOVER_PX=4;
+function hideGapBtn(){
+  if(gapBtn&&gapBtn.parentNode) gapBtn.parentNode.removeChild(gapBtn);
+  gapBtn=null; gapBtnIdx=null;
+}
+function showGapBtn(idx){
+  if(gapBtnIdx===idx&&gapBtn&&gapBtn.parentNode) return;   // already showing this exact gap
+  hideGapBtn();
+  const ws=$('words');
+  const btn=document.createElement('button');
+  btn.type='button'; btn.className='wgap-add'; btn.textContent='+';
+  btn.title='insert word here'; btn.tabIndex=-1;
+  btn.onmousedown=e=>e.stopPropagation();
+  btn.onclick=e=>{ e.stopPropagation(); hideGapBtn(); insertWordAt(idx); };
+  if(idx>=chips.length) ws.appendChild(btn); else ws.insertBefore(btn,chips[idx]);
+  gapBtn=btn; gapBtnIdx=idx;
+}
+$('words').addEventListener('mousemove',e=>{
+  if(!chips.length) return;
+  let best=null;
+  chips.forEach((c,i)=>{
+    const cr=c.getBoundingClientRect();
+    if(e.clientY<cr.top-8||e.clientY>cr.bottom+8) return;   // different row
+    const dRight=Math.abs(e.clientX-cr.right);   // near this chip's right edge -> before it
+    const dLeft=Math.abs(e.clientX-cr.left);      // near this chip's left edge -> after it
+    if(dRight<=GAP_HOVER_PX&&(!best||dRight<best.d)) best={idx:i,d:dRight};
+    if(dLeft<=GAP_HOVER_PX&&(!best||dLeft<best.d)) best={idx:i+1,d:dLeft};
+  });
+  if(!best&&gapBtn){
+    // Cursor may now sit over the button itself (the neighbour it pushed away moved out
+    // of threshold range) -- keep it shown rather than flicker it away.
+    const br=gapBtn.getBoundingClientRect();
+    if(e.clientX>=br.left-4&&e.clientX<=br.right+4&&e.clientY>=br.top-4&&e.clientY<=br.bottom+4) return;
+  }
+  if(best) showGapBtn(best.idx); else hideGapBtn();
+});
+$('words').addEventListener('mouseleave',hideGapBtn);
 
 function render(){
   if(sampleMode){
@@ -1315,6 +1392,51 @@ function editActiveTime(which,el){
     if(e.key==='Escape'){e.preventDefault();finish(false);}
   };
   inp.onblur=()=>finish(true);
+}
+
+// In-place text edit triggered by double-clicking a word's label inside the "current word"
+// visualization bar (the mid-height highlight band), rather than the chip in the preview
+// row above. Mirrors editWord()'s save/was/delete-on-empty behaviour, but floats a plain
+// <input> over the canvas at the word's on-screen position instead of swapping a DOM span.
+let barEditing=false;
+function editBarWord(idx){
+  if(barEditing||!gold||!gold[idx]) return;
+  stop();
+  barEditing=true;
+  const before=gold[idx].word;
+  const r=zm.getBoundingClientRect();
+  const [lo,hi]=zwin();
+  const X=t=>(t-lo)/(hi-lo)*r.width;
+  const wd=gold[idx];
+  const midX=r.left+(X(wd.start)+X(wd.end))/2;
+  const midY=r.top+r.height*0.50;
+  const inp=document.createElement('input');
+  inp.className='wedit'; inp.value=before; inp.dir='auto';
+  inp.style.position='fixed'; inp.style.left=midX+'px'; inp.style.top=midY+'px';
+  inp.style.transform='translate(-50%,-50%)'; inp.style.textAlign='center'; inp.style.zIndex=100;
+  document.body.appendChild(inp);
+  inp.focus(); inp.select();
+  const done=keep=>{
+    if(!barEditing) return;              // already finished (e.g. resize cancelled it)
+    barEditing=false; inp.remove();
+    const v=inp.value.trim();
+    if(keep && !v){ delWord(idx); return; }         // emptied = delete
+    if(keep && v && v!==before){
+      if(gold[idx].was===undefined && !gold[idx].added) gold[idx].was=before;
+      gold[idx].word=v;
+      touched.add(idx);
+      save();
+    }
+    buildWords(); render(); draw();
+  };
+  inp.onkeydown=e=>{
+    e.stopPropagation();
+    if(e.key==='Enter'){e.preventDefault();done(true);}
+    if(e.key==='Escape'){e.preventDefault();done(false);}
+  };
+  inp.onblur=()=>done(true);
+  const cancelOnResize=()=>done(false);
+  addEventListener('resize',cancelOnResize,{once:true});
 }
 
 // `touched` is a set of positions, so inserting or removing a word renumbers every entry
@@ -1474,6 +1596,22 @@ async function addWordBefore(){
   editWord(wi,chips[wi]);        // straight into typing; a word called "?" helps nobody
 }
 
+// Ctrl+drag over a stretch of the bar with no existing word creates one spanning exactly
+// the dragged range. Insertion position is derived from the times themselves (not from
+// `wi`), since the drag can happen anywhere -- including before the first or after the
+// last word.
+async function createWordAt(s,e){
+  if(!(e>s)) return;
+  let idx=gold.findIndex(wd=>wd.start>=e-1e-9);
+  if(idx<0) idx=gold.length;
+  gold.splice(idx,0,{word:'?',start:s,end:e,added:true});
+  touched=shiftTouched(touched,idx,1); touched.add(idx);
+  wi=idx; edge='end';
+  fitWord(); buildWords(); render(); draw();
+  await save();
+  editBarWord(wi);        // straight into typing, same as the +before/+after buttons
+}
+
 function untangleWords(){
   if(!gold||gold.length<=1) return;
   if(!confirm("Untangle words will change any overlapping word timings regardless of original values. Continue?")) return;
@@ -1589,10 +1727,12 @@ function resetToBaseline(){
 
 // A word the ASR invented. The clip keeps its original `transcript`, so a word missing from
 // `words` is still recoverable downstream -- deletion needs no flag of its own.
-function delWord(){
+function delWord(idx){
   if(gold.length<=1) return;
-  gold.splice(wi,1);
-  touched=shiftTouched(touched,wi,-1);
+  idx=(idx===undefined)?wi:idx;
+  gold.splice(idx,1);
+  touched=shiftTouched(touched,idx,-1);
+  if(wi>idx) wi--;
   wi=Math.min(wi,gold.length-1);
   buildWords(); render(); draw(); save();
 }
@@ -1698,6 +1838,42 @@ function attachZoomEvents(canvas){
     const r=canvas.getBoundingClientRect();
     const at=x=>{const [lo,hi]=zwin(); return lo+((x-r.left)/r.width)*(hi-lo);};
     const px=t=>{const [lo,hi]=zwin(); return (t-lo)/(hi-lo)*r.width+r.left;};
+
+    // Ctrl/Cmd+drag over a stretch with no existing word draws out a brand new one. The
+    // drag is clamped to the surrounding silence so it can never eat into a neighbour.
+    if((e.ctrlKey||e.metaKey)&&buf){
+      const t0=at(e.clientX);
+      const overlapsWord=gold.some(wd=>t0>wd.start-1e-6&&t0<wd.end+1e-6);
+      if(!overlapsWord){
+        e.preventDefault();
+        let glo=tmin(), ghi=total();
+        gold.forEach(wd=>{
+          if(wd.end<=t0+1e-9&&wd.end>glo) glo=wd.end;
+          if(wd.start>=t0-1e-9&&wd.start<ghi) ghi=wd.start;
+        });
+        let a=t0,b=t0;
+        createDrag={s:a,e:b}; draw();
+        canvas.classList.add('grabbing');
+        const mv=ev=>{
+          b=Math.max(glo,Math.min(at(ev.clientX),ghi));
+          createDrag={s:Math.min(a,b),e:Math.max(a,b)};
+          draw();
+        };
+        const up=()=>{
+          canvas.classList.remove('grabbing');
+          removeEventListener('mousemove',mv); removeEventListener('mouseup',up);
+          const MIN_LEN=0.02;
+          let s=createDrag.s, en=createDrag.e;
+          createDrag=null;
+          if(en-s<MIN_LEN){ en=Math.min(ghi,s+MIN_LEN); if(en-s<MIN_LEN) s=Math.max(glo,en-MIN_LEN); }
+          if(en-s<0.005){ draw(); return; }
+          createWordAt(s,en);
+        };
+        addEventListener('mousemove',mv); addEventListener('mouseup',up);
+        return;
+      }
+    }
+
     // Playhead is grabbable ONLY in top 20% of the bar; remaining 80% left for interactions
     const inPlayheadZone=e.clientY<=r.top+r.height*0.20;
     if(Math.abs(px(now())-e.clientX)<9 && inPlayheadZone){
@@ -1794,6 +1970,20 @@ function attachZoomEvents(canvas){
 }
 attachZoomEvents(zm);
 attachZoomEvents(wave);
+
+// Double-click a word's label in the "current word" bar's highlight band (the mid 40%
+// overlay where word spans and their text are drawn) to edit that word's text in place.
+zm.addEventListener('dblclick',e=>{
+  if(!buf) return;
+  const r=zm.getBoundingClientRect();
+  if(e.clientY<r.top+r.height*0.30||e.clientY>r.top+r.height*0.70) return;
+  const [lo,hi]=zwin();
+  const t=lo+((e.clientX-r.left)/r.width)*(hi-lo);
+  const idx=gold.findIndex(wd=>t>=wd.start&&t<=wd.end);
+  if(idx<0) return;
+  e.preventDefault();
+  editBarWord(idx);
+});
 
 (function(){
   const el=$('scroll'), th=$('thumb');
