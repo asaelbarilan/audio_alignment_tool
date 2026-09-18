@@ -82,6 +82,11 @@
   button:disabled:hover{background:#2a2e37}
  button.on{background:#3d6fd6;border-color:#3d6fd6;color:#fff}
  button.go{background:#2b6b46;border-color:#2b6b46;color:#fff;font-weight:600}
+ .spinner{display:inline-block;width:11px;height:11px;border:2px solid #3a3f4a;
+   border-top-color:#6aa0ff;border-radius:50%;animation:spin .7s linear infinite;
+   vertical-align:middle;margin-right:6px}
+ @keyframes spin{to{transform:rotate(360deg)}}
+ #alignStatus{color:#8a8f98;font-size:12px}
  select{background:#2a2e37;color:#e8e8ea;border:1px solid #3a3f4a;border-radius:6px;padding:6px}
   .sep{width:1px;height:26px;background:#333844;margin:0 4px}
   .tag{color:#6f757f;font-size:12px;margin-right:2px}
@@ -343,6 +348,9 @@
   <div class="sep"></div>
   <button id="untangleBtn" title="Fix overlapping words by splitting shared space equally">untangle words</button>
   <button id="resetBaselineBtn" title="Reset all words to dataset baseline">reset to baseline</button>
+  <div class="sep"></div>
+  <button id="alignBtn" title="Call the aligner service to re-time this clip from scratch, replacing your current marks">align</button>
+  <span id="alignStatus"></span>
   <label class="chk"><input type="checkbox" id="playMark" checked> play word on mark change</label>
 </div>
 <div class="row" id="snapRow">
@@ -506,7 +514,7 @@ function setUrlParam(key, val){
 }
 
 async function showOverview(){
-  stop();
+  stop(); cancelAlign();
   $('workspace').style.display='none';
   $('overviewScreen').classList.add('on');
   $('overviewLink').classList.add('cur');
@@ -696,7 +704,7 @@ async function claimClip(key){
 }
 
 async function openClip(key, forceReadOnly){
-  stop();
+  stop(); cancelAlign();
   const r=await fetch(api('/api/clip-marks?key='+encodeURIComponent(key)));
   if(!r.ok){
     alert('Could not load clip ('+r.status+')');
@@ -815,7 +823,7 @@ async function openClip(key, forceReadOnly){
 }
 
 async function backToTagging(){
-  stop();
+  stop(); cancelAlign();
   isReadOnly=false;
   currentClipDetail=null;
   $('readOnlyBanner').style.display='none';
@@ -911,6 +919,10 @@ function gate(authed){
 }
 
 async function load(){
+  try{
+    const meta=await (await fetch(api('/api/meta'))).json();
+    if(meta && meta.aligner===false) $('alignBtn').title='Aligner disabled';
+  }catch(e){}
   clips=await (await fetch(api('/api/clips'))).json();
   const v=PARAMS.get('view');
   const cl=PARAMS.get('clip');
@@ -2197,6 +2209,134 @@ function resetToBaseline(){
   save();
 }
 
+// ---- call-out to the aligner service --------------------------------------
+//
+// Unlike untangle/reset-baseline (instant, local, free), this is a real network call to a
+// GPU worker that can take minutes on a cold start (api-client-guide.md §4), so it gets its
+// own spinner, its own cancel path, and disables the other clip-mutating actions while it
+// is in flight -- navigating away mid-align would apply the result to the wrong clip, or
+// leave a job running nobody is watching.
+let alignJobId=null, alignPollTimer=null, alignForKey=null;
+
+function setAlignBusy(busy){
+  ['saveonly','save','unmark','prevc','skip','resetBaselineBtn','untangleBtn'].forEach(id=>{
+    const el=$(id); if(el) el.disabled=busy;
+  });
+}
+
+async function startAlign(){
+  if(sampleMode||isReadOnly||alignJobId) return;
+  const c=clips[ci];
+  const key=c ? (c.key||c.id) : '';
+  // Align using the words (text) from the USER marking, not the baseline
+  const userWords = gold.map(w => (w.word||'').trim()).filter(Boolean);
+  if(!userWords.length){
+    finishAlignUI('No words to align');
+    return 'No words to align';
+  }
+  setAlignBusy(true);
+  $('alignBtn').textContent='cancel align';
+  $('alignBtn').classList.add('on');
+  $('alignStatus').innerHTML='<span class="spinner"></span>calling the aligner service'
+    +' (can take a couple of minutes on a cold start)&hellip;';
+  try{
+    const r=await fetch(api('/api/align'),{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key, words:userWords, text:userWords.join(' ')})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok || j.error){
+      const err = j.error || ('HTTP '+r.status);
+      finishAlignUI(err);
+      return err;
+    }
+    alignJobId=j.job_id; alignForKey=key;
+    pollAlign();
+  }catch(err){
+    const msg = ''+err;
+    finishAlignUI(msg);
+    return msg;
+  }
+}
+
+function pollAlign(){
+  alignPollTimer=setTimeout(async ()=>{
+    if(!alignJobId) return;
+    try{
+      const r=await fetch(api('/api/align-status?job='+encodeURIComponent(alignJobId)));
+      const j=await r.json().catch(()=>({}));
+      if(!r.ok || j.error){
+        const err = j.error || ('HTTP '+r.status);
+        finishAlignUI(err);
+        return err;
+      }
+      if(j.status==='running'){ pollAlign(); return; }
+      if(j.status==='done'){ applyAlignResult(j.words); finishAlignUI('Align complete \u2014 replaced your marks.'); }
+      else if(j.status==='cancelled'){ finishAlignUI('Align cancelled.'); }
+      else{ finishAlignUI(j.error || 'Align failed'); }
+    }catch(err){
+      finishAlignUI('Align failed: '+err);
+    }
+  },1200);
+}
+
+function applyAlignResult(words){
+  if(!words||!words.length) return;
+  const c=clips[ci];
+  // The annotator may have navigated to a different clip while this was in flight (nav is
+  // disabled via setAlignBusy, but "back to tagging"/"overview" are not) -- in that case the
+  // result belongs to a clip that is no longer on screen, so drop it rather than overwrite
+  // whatever is showing now.
+  if(!c || (c.key||c.id)!==alignForKey || sampleMode || isReadOnly) return;
+  stop();
+  gold=words.map((w, i)=>({
+    word: w.word,
+    start: w.start,
+    end: w.end,
+    ...(gold[i] && gold[i].was !== undefined ? {was: gold[i].was} : {}),
+    ...(gold[i] && gold[i].added ? {added: true} : {})
+  }));
+  touched=new Set(gold.map((_,i)=>i));
+  wi=0; edge='end';
+  fitWord();
+  buildWords();
+  render();
+  draw();
+  clips[ci].saved=gold.map(w=>({...w}));
+  save();
+}
+
+async function cancelAlign(){
+  if(!alignJobId) return;
+  const jobId=alignJobId;
+  if(alignPollTimer){ clearTimeout(alignPollTimer); alignPollTimer=null; }
+  alignJobId=null; alignForKey=null;
+  $('alignStatus').innerHTML='<span class="spinner"></span>cancelling\u2026';
+  try{
+    // Best effort either way -- the server marks the job cancelled and, on our side,
+    // shuts the socket to the aligner out from under whichever call is still blocked on
+    // it. Once this resolves (or fails) the annotator's current marks are untouched.
+    await fetch(api('/api/align-cancel'),{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({job_id:jobId})});
+  }catch(err){ /* the job is treated as cancelled client-side regardless */ }
+  finishAlignUI('Align cancelled.');
+}
+
+function finishAlignUI(msg){
+  if(alignPollTimer){ clearTimeout(alignPollTimer); alignPollTimer=null; }
+  alignJobId=null; alignForKey=null;
+  setAlignBusy(false);
+  const btn=$('alignBtn');
+  btn.textContent='align'; btn.classList.remove('on');
+  btn.value = msg || '';
+  btn.dataset.status = msg || '';
+  if(msg==='Aligner disabled') btn.title='Aligner disabled';
+  $('alignStatus').textContent=msg||'';
+  if(msg) setTimeout(()=>{ if($('alignStatus').textContent===msg) $('alignStatus').textContent=''; },5000);
+  if(!sampleMode&&!isReadOnly) render();  // re-sync button states (e.g. "unmark") after the forced-enable above
+}
+
+$('alignBtn').onclick=()=>{ return alignJobId?cancelAlign():startAlign(); };
+window.align = startAlign;
+
 // A word the ASR invented. The clip keeps its original `transcript`, so a word missing from
 // `words` is still recoverable downstream -- deletion needs no flag of its own.
 function delWord(idx){
@@ -2581,7 +2721,14 @@ $('unmark').onclick=async ()=>{
 // A drag-in preview: the CSV supplies word boundaries, the WAV supplies audio, and both
 // are decoded entirely client-side. `save`/`saveNext` already no-op under sampleMode, so
 // every edit made while inspecting a sample stays in memory and is never sent anywhere.
-function setClipActionsVisible(v){ $('clipNav').style.display=v?'inline-flex':'none'; $('saveRow').style.display=v?'':'none'; }
+function setClipActionsVisible(v){
+  $('clipNav').style.display=v?'inline-flex':'none'; $('saveRow').style.display=v?'':'none';
+  // Calling the aligner service costs real time and GPU money, unlike the local-only
+  // untangle/reset-baseline actions -- keep it out of read-only and sample-mode entirely
+  // rather than just no-op'ing its save like those do.
+  if(!v) cancelAlign();
+  $('alignBtn').style.display=v?'':'none'; $('alignStatus').style.display=v?'':'none';
+}
 function parseSampleCsv(text){
   const lines=text.split(/\r\n|\n|\r/).map(l=>l.trim()).filter(l=>l.length);
   if(!lines.length) throw new Error('file is empty');

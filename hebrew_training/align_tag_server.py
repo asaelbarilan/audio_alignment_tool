@@ -28,13 +28,17 @@ only used to rank clips by disagreement.
 from __future__ import annotations
 
 import argparse
+import base64
+import http.client
 import io
 import json
 import os
 import re
+import socket
 import threading
 import time
 import unicodedata
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -373,6 +377,272 @@ def clip_wav(clip: dict, dataset: Dataset) -> tuple[bytes, float]:
     buffer = io.BytesIO()
     soundfile.write(buffer, wav, rate, format="WAV", subtype="PCM_16")
     return buffer.getvalue(), 0.0
+
+
+ALIGNER_SAMPLE_RATE = 16000  # the aligner service hard-asserts this; see api-client-guide.md §2
+
+
+def resample_linear(wav, orig_rate: int, target_rate: int):
+    """Plain linear-interpolation resample -- no scipy/librosa dependency for what is,
+    in practice, a rare path: most clips in these datasets are already 16kHz, so this only
+    runs on the odd one that is not. Good enough for feeding a forced aligner, not meant
+    for anything that cares about audio fidelity."""
+    import numpy as np
+
+    if orig_rate == target_rate or len(wav) == 0:
+        return wav
+    duration = len(wav) / orig_rate
+    n_target = max(1, int(round(duration * target_rate)))
+    x_old = np.linspace(0, duration, num=len(wav), endpoint=False)
+    x_new = np.linspace(0, duration, num=n_target, endpoint=False)
+    return np.interp(x_new, x_old, wav).astype("float32")
+
+
+def clip_wav_16k_mono(clip: dict, dataset: Dataset) -> bytes:
+    """The clip's audio as mono 16kHz PCM16 wav bytes -- exactly what the aligner service
+    requires (api-client-guide.md §2), regardless of what the dataset's own audio is."""
+    import soundfile
+
+    raw = dataset.read_bytes(clip["audio"])
+    with soundfile.SoundFile(io.BytesIO(raw)) as handle:
+        rate = handle.samplerate
+        wav = handle.read(dtype="float32", always_2d=False)
+    if getattr(wav, "ndim", 1) > 1:
+        wav = wav.mean(axis=1)
+    if rate != ALIGNER_SAMPLE_RATE:
+        wav = resample_linear(wav, rate, ALIGNER_SAMPLE_RATE)
+        rate = ALIGNER_SAMPLE_RATE
+    buffer = io.BytesIO()
+    soundfile.write(buffer, wav, rate, format="WAV", subtype="PCM_16")
+    return buffer.getvalue()
+
+
+class AlignerError(Exception):
+    """The aligner service could not be reached, or answered with something unusable."""
+
+
+class AlignerCancelled(Exception):
+    """The annotator cancelled this align while it was in flight."""
+
+
+# Punctuation that is never a real Hebrew letter (unlike the geresh/gershayim ' and " used
+# inside real words, e.g. צה"ל) but that the deployed aligner's uroman step turns into its
+# own token with no matching audio -- observed directly against the endpoint as a 500
+# ("speech file ... failed for '.'") on ordinary sentence-final periods. Stripped only from
+# the copy sent to the aligner; the transcript kept in `clip`/the gold row is untouched, and
+# nothing here changes the space-separated word *count*, which is what has to keep matching.
+_ALIGNER_STRIP = str.maketrans("", "", ".,;:!?…")
+
+
+def sanitize_transcript_for_aligner(text: str) -> str:
+    return text.translate(_ALIGNER_STRIP)
+
+
+def aligner_config() -> tuple[str, str, str | None, str]:
+    endpoint_id = os.environ.get("ENDPOINT_ID", "")
+    api_key = os.environ.get("RP_API_KEY") or os.environ.get("RUNPOD_API_KEY", "")
+    if not endpoint_id or not api_key:
+        raise AlignerError("Aligner disabled")
+    model_name = os.environ.get("ALIGNER_MODEL_NAME") or None
+    language = os.environ.get("ALIGNER_LANGUAGE", "heb")
+    return endpoint_id, api_key, model_name, language
+
+
+ALIGN_TIMEOUT = 180  # seconds -- cold starts can take a couple of minutes, see guide §4
+
+
+class AlignJob:
+    """One in-flight (or finished) call to the aligner service.
+
+    `conn` is the live HTTP connection while a request is in flight, guarded by `lock` so
+    a cancel from another thread never races the request thread over the same socket.
+    Cancelling a Load-Balancer HTTP call has no API of its own -- the call itself *is* the
+    job, so ending it means shutting the socket out from under whichever thread is blocked
+    reading the response. `shutdown()` (not `close()`) is what makes that safe: it acts on
+    the underlying kernel socket rather than just this thread's handle to it, so it reliably
+    interrupts a concurrent blocking read instead of racing a possibly-reused fd.
+    """
+
+    def __init__(self, job_id: str, who: str, clip_key: str, user_words: list[str]):
+        self.id = job_id
+        self.who = who
+        self.clip_key = clip_key
+        self.user_words = user_words
+        self.status = "running"  # running | done | error | cancelled
+        self.words: list[dict] | None = None
+        self.error: str | None = None
+        self.created_at = time.time()
+        self.finished_at: float | None = None
+        self.cancel_event = threading.Event()
+        self.lock = threading.Lock()
+        self.conn: http.client.HTTPConnection | None = None
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+        with self.lock:
+            conn = self.conn
+        if conn is None:
+            return
+        sock = getattr(conn, "sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # already closed, or never got past connect(); nothing to interrupt
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 -- cancellation must not itself raise
+            pass
+
+
+ALIGN_LOCK = threading.Lock()
+ALIGN_JOBS: dict[str, AlignJob] = {}
+ALIGN_ACTIVE: dict[tuple[str, str], str] = {}  # (who, clip_key) -> running job id
+ALIGN_JOB_MAX_AGE = 3600  # prune finished jobs an hour after they finish
+
+
+def prune_align_jobs() -> None:
+    now = time.time()
+    for job_id, job in list(ALIGN_JOBS.items()):
+        if job.finished_at is not None and now - job.finished_at > ALIGN_JOB_MAX_AGE:
+            ALIGN_JOBS.pop(job_id, None)
+
+
+def call_aligner(wav_bytes: bytes, transcript: str, job: AlignJob) -> list[dict]:
+    """POST /align on the RunPod load-balancer endpoint (see api-client-guide.md). Blocks
+    the calling thread for as long as the call takes -- run this on a background thread,
+    never on the request-handler thread, since a cold start can take minutes.
+    """
+    endpoint_id, api_key, model_name, language = aligner_config()
+    payload = {
+        "audio_base64": base64.b64encode(wav_bytes).decode("ascii"),
+        "transcript": transcript,
+        "language": language,
+    }
+    if model_name:
+        payload["model_name"] = model_name
+    body = json.dumps(payload).encode("utf-8")
+    conn = http.client.HTTPSConnection(f"{endpoint_id}.api.runpod.ai", timeout=ALIGN_TIMEOUT)
+    with job.lock:
+        if job.cancel_event.is_set():
+            conn.close()
+            raise AlignerCancelled()
+        job.conn = conn
+    try:
+        conn.request(
+            "POST",
+            "/align",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        resp = conn.getresponse()
+        raw = resp.read()
+    except (OSError, http.client.HTTPException) as exc:
+        if job.cancel_event.is_set():
+            raise AlignerCancelled() from exc
+        raise AlignerError(f"could not reach aligner service: {exc}") from exc
+    finally:
+        with job.lock:
+            job.conn = None
+        conn.close()
+    if job.cancel_event.is_set():
+        raise AlignerCancelled()
+    if resp.status != 200:
+        detail = raw.decode("utf-8", "replace")
+        try:
+            detail = json.loads(detail).get("error", detail)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        raise AlignerError(f"aligner service returned {resp.status}: {detail}")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise AlignerError("aligner service returned invalid JSON") from exc
+    words = data.get("words")
+    if not isinstance(words, list) or not words:
+        raise AlignerError("aligner service returned no words")
+    return words
+
+
+def run_align_job(
+    job: AlignJob,
+    dataset: Dataset,
+    clip: dict,
+    clips: list[dict],
+    args: argparse.Namespace,
+) -> None:
+    """Runs on a background thread, started by POST /api/align. Talks to the aligner
+    service using the words from the annotator's markings (not the dataset baseline), then
+    files the outcome on `job` and updates the annotator's saved marks if successful.
+    """
+    try:
+        wav_bytes = clip_wav_16k_mono(clip, dataset)
+        transcript_raw = " ".join(job.user_words)
+        transcript = sanitize_transcript_for_aligner(transcript_raw)
+        words = call_aligner(wav_bytes, transcript, job)
+        cleaned = [
+            {
+                "word": clean(str(w.get("word", ""))),
+                "start": float(w["start"]),
+                "end": float(w["end"]),
+            }
+            for w in words
+            if w.get("start") is not None and w.get("end") is not None
+        ]
+        if not cleaned:
+            raise AlignerError("aligner returned no timed words")
+        # Ensure the user's exact word tokens (spelling, punctuation) are preserved on the
+        # aligned timings.
+        if len(job.user_words) == len(cleaned):
+            for uw, cw in zip(job.user_words, cleaned):
+                cw["word"] = uw
+        with job.lock:
+            if job.cancel_event.is_set():
+                job.status = "cancelled"
+            else:
+                job.words = cleaned
+                job.status = "done"
+
+        with job.lock:
+            is_done = (job.status == "done")
+        if is_done and job.words:
+            with LOCK:
+                idx_match = [i for i, c in enumerate(clips) if clip_key(c) == job.clip_key]
+                if idx_match:
+                    index = idx_match[0]
+                    if STORE is not None:
+                        mine = STORE.load(job.who, clips)
+                        mine[index] = job.words
+                        STORE.save(job.who, clips, mine)
+                    else:
+                        path = gold_path(args, job.who)
+                        mine = load_saved(path, clips)
+                        mine[index] = job.words
+                        write_gold(path, clips, mine)
+                    if CLAIMS is not None:
+                        CLAIMS.touch(job.who, job.clip_key)
+    except AlignerCancelled:
+        with job.lock:
+            job.status = "cancelled"
+    except AlignerError as exc:
+        with job.lock:
+            job.status = "cancelled" if job.cancel_event.is_set() else "error"
+            if job.status == "error":
+                job.error = str(exc)
+    except Exception as exc:  # noqa: BLE001 -- surface it, don't hang the client's spinner
+        with job.lock:
+            job.status = "cancelled" if job.cancel_event.is_set() else "error"
+            if job.status == "error":
+                job.error = f"unexpected error: {exc}"
+    finally:
+        job.finished_at = time.time()
+        with ALIGN_LOCK:
+            if ALIGN_ACTIVE.get((job.who, job.clip_key)) == job.id:
+                del ALIGN_ACTIVE[(job.who, job.clip_key)]
 
 
 PAGE_FILE = Path(__file__).with_name("align_tag_page.html")
@@ -1236,14 +1506,29 @@ def make_handler(args, dataset: Dataset, clips):
                         409, b'{"error":"pick a name"}', "application/json"
                     )
             if route == "/api/meta":
+                aligner_ok = bool(
+                    os.environ.get("ENDPOINT_ID")
+                    and (os.environ.get("RP_API_KEY") or os.environ.get("RUNPOD_API_KEY"))
+                )
                 meta = {
                     "multi": True,
                     "clips": len(clips),
                     "dataset": dataset.name,
+                    "aligner": aligner_ok,
                 }
                 return self.send(
                     200, json.dumps(meta).encode("utf-8"), "application/json"
                 )
+            if route == "/api/align":
+                try:
+                    aligner_config()
+                    return self.send(200, b'{"ok":true}', "application/json")
+                except AlignerError as exc:
+                    return self.send(
+                        400,
+                        json.dumps({"error": str(exc), "message": str(exc)}).encode("utf-8"),
+                        "application/json",
+                    )
             if route == "/api/export":
                 # The marks live in Postgres once hosted, but the rest of the pipeline reads
                 # jsonl keyed on clip id. So export in exactly that shape, with the
@@ -1463,6 +1748,27 @@ def make_handler(args, dataset: Dataset, clips):
                     json.dumps(body, ensure_ascii=False).encode("utf-8"),
                     "application/json; charset=utf-8",
                 )
+            if route == "/api/align-status":
+                who = self.who() or "anon"
+                from urllib.parse import parse_qs
+
+                job_id = (parse_qs(urlparse(self.path).query).get("job") or [""])[0]
+                job = ALIGN_JOBS.get(job_id)
+                if job is None or job.who != who:
+                    return self.send(
+                        404, b'{"error":"unknown align job"}', "application/json"
+                    )
+                with job.lock:
+                    body = {
+                        "status": job.status,
+                        "words": job.words,
+                        "error": job.error,
+                    }
+                return self.send(
+                    200,
+                    json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
             if route.startswith("/api/audio/"):
                 target = unquote(route[len("/api/audio/") :])
                 clip = by_key.get(target)
@@ -1573,6 +1879,98 @@ def make_handler(args, dataset: Dataset, clips):
                 with LOCK:
                     CLAIMS.unfinish(who, key)
                 return self.send(200, b'{"ok":true}', "application/json")
+            if route == "/api/align":
+                who = self.who() or "anon"
+                try:
+                    aligner_config()
+                except AlignerError as exc:
+                    return self.send(
+                        400,
+                        json.dumps({"error": str(exc), "message": str(exc)}).encode("utf-8"),
+                        "application/json",
+                    )
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                key = body.get("key")
+                clip = by_key.get(key) if key else None
+                if clip is None:
+                    return self.send(
+                        400, b'{"error":"unknown clip"}', "application/json"
+                    )
+                key = clip_key(clip)
+                # Take the list of words (text) from the USER marking, not the baseline.
+                # 1. From the request body (explicit words list or text string)
+                # 2. Or from the annotator's existing saved marks for this clip
+                # 3. Or fall back to clip baseline words
+                user_words: list[str] = []
+                if "words" in body and isinstance(body["words"], list):
+                    user_words = [
+                        clean(w["word"] if isinstance(w, dict) else str(w))
+                        for w in body["words"]
+                        if clean(w["word"] if isinstance(w, dict) else str(w))
+                    ]
+                elif "text" in body and isinstance(body["text"], str):
+                    user_words = [clean(w) for w in body["text"].split(" ") if clean(w)]
+
+                if not user_words:
+                    with LOCK:
+                        idx_match = [i for i, c in enumerate(clips) if clip_key(c) == key]
+                        if idx_match:
+                            idx = idx_match[0]
+                            saved_marks = (
+                                STORE.load(who, clips)
+                                if STORE is not None
+                                else load_saved(gold_path(args, who), clips)
+                            )
+                            if idx in saved_marks and saved_marks[idx]:
+                                user_words = [
+                                    clean(w["word"])
+                                    for w in saved_marks[idx]
+                                    if clean(w.get("word", ""))
+                                ]
+                if not user_words:
+                    user_words = [clean(w["word"]) for w in clip["a"] if clean(w.get("word", ""))]
+
+                if not user_words:
+                    return self.send(
+                        400, b'{"error":"clip has no words to align"}', "application/json"
+                    )
+
+                with ALIGN_LOCK:
+                    prune_align_jobs()
+                    # Already aligning this clip for this annotator -- hand back the same
+                    # job rather than kicking off a second, duplicate call to the aligner.
+                    existing = ALIGN_ACTIVE.get((who, key))
+                    if existing is not None:
+                        return self.send(
+                            200,
+                            json.dumps({"job_id": existing}).encode("utf-8"),
+                            "application/json",
+                        )
+                    job_id = uuid.uuid4().hex
+                    job = AlignJob(job_id, who, key, user_words)
+                    ALIGN_JOBS[job_id] = job
+                    ALIGN_ACTIVE[(who, key)] = job_id
+                threading.Thread(
+                    target=run_align_job,
+                    args=(job, dataset, clip, clips, args),
+                    daemon=True,
+                ).start()
+                return self.send(
+                    200,
+                    json.dumps({"job_id": job_id}).encode("utf-8"),
+                    "application/json",
+                )
+            if route == "/api/align-cancel":
+                who = self.who() or "anon"
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                job = ALIGN_JOBS.get(body.get("job_id", ""))
+                if job is not None and job.who == who:
+                    job.cancel()
+                # Idempotent either way: a job that already finished, or one the client
+                # never got a job_id for, is just as "cancelled" from the caller's side.
+                return self.send(200, b'{"ok":true}', "application/json")
             if route != "/api/gold":
                 return self.send(404, b"not found", "text/plain")
             length = int(self.headers.get("Content-Length", 0))
@@ -1652,6 +2050,11 @@ def main() -> None:
         print("google sign-in required; ?who= ignored")
     CLAIMS = STORE if STORE is not None else FileClaims(args.out)
     print(f"split is always on: each annotator gets their own clips, {BLOCK} at a time")
+    try:
+        aligner_config()
+        print("aligner: configured (ENDPOINT_ID and RP_API_KEY/RUNPOD_API_KEY set)")
+    except AlignerError as exc:
+        print(f"aligner: {exc}")
 
     dataset = resolve_dataset(args)
     meta = dataset.metadata()

@@ -15,3 +15,10 @@ Marks go to Postgres (`DATABASE_URL`), one row per annotator. `GET /api/export` 
 back out as jsonl in the same shape as the input manifests, plus an `annotator` field.
 
 Sign-in is Google via xhostd, verified server-side from the signed cookie.
+
+The **align** button re-times a clip from scratch by calling a Multilingual-Word-Aligner
+RunPod endpoint with the clip's audio and transcript (see `api-client-guide.md`), replacing
+the annotator's current marks with the result. Needs `ENDPOINT_ID` and `RP_API_KEY` (or
+`RUNPOD_API_KEY`) in the environment; without them the button returns "Aligner disabled".
+Optional: `ALIGNER_MODEL_NAME` (must match whichever model the endpoint was deployed with)
+and `ALIGNER_LANGUAGE` (default `heb`).
