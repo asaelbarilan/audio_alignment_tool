@@ -2561,7 +2561,7 @@ $('m5').onclick=()=>nudgeWithSnap(-0.005); $('p5').onclick=()=>nudgeWithSnap(+0.
 $('fit').onclick=()=>{fitWord();draw();};
 $('fitall').onclick=()=>{view=[Math.max(tmin(),gold[0].start-0.2),
   Math.min(total(),gold[gold.length-1].end+0.2)];draw();};
-$('addwb').onclick=addWordBefore; $('addw').onclick=addWord; $('delw').onclick=delWord;
+$('addwb').onclick=addWordBefore; $('addw').onclick=addWord; $('delw').onclick=()=>delWord();
 $('untangleBtn').onclick=untangleWords;
 $('resetBaselineBtn').onclick=resetToBaseline;
 $('prevw').onclick=()=>goWord(wi-1); $('nextw').onclick=()=>goWord(wi+1);
