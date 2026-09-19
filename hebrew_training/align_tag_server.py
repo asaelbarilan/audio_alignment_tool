@@ -1664,6 +1664,18 @@ def make_handler(args, dataset: Dataset, clips):
                     "clips": len(clips),
                     "annotators": rows,
                     "marked_total": sum(r["marked"] for r in rows),
+                    # What the scorer is actually working with. Without this, a dashboard
+                    # reporting "no marked clips" while marks plainly exist can only be
+                    # guessed at from outside, since every other route needs a sign-in.
+                    "labels": sorted({lb["source"] for c in clips for lb in c.get("labels", [])}),
+                    "eval": {
+                        "computed": EVAL_CACHE.get("result") is not None,
+                        "running": bool(EVAL_CACHE.get("running")),
+                        "error": EVAL_CACHE.get("error"),
+                        "marked_clips": (EVAL_CACHE.get("result") or {}).get("marked_clips"),
+                        "unmatched_marks": (EVAL_CACHE.get("result") or {}).get("unmatched_marks"),
+                        "scored": sorted((EVAL_CACHE.get("result") or {}).get("aligners", {})),
+                    },
                 }
                 # Where the audio is actually coming from. Without this there is no way to
                 # tell from outside which dataset source is live.
