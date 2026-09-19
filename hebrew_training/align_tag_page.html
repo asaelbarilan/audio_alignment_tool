@@ -160,6 +160,13 @@
   .evText{direction:rtl;text-align:right;max-width:300px;overflow:hidden;
           text-overflow:ellipsis;display:inline-block;vertical-align:bottom}
   .evEmpty{color:#8a8f98;padding:18px 0}
+  .evCi{display:block;color:#6f757f;font-size:10.5px;font-weight:400}
+  .evSeed{display:block;color:#d8a13a;font-size:11px;font-weight:500;margin-top:2px}
+  .evWarn{background:#2a2213;border:1px solid #5a4318;color:#e8c77a;border-radius:6px;
+          padding:10px 12px;font-size:12.5px;line-height:1.55;margin-top:12px}
+  .evYes{color:#4ec98a;font-weight:600}
+  .evNo{color:#8a8f98}
+  .evUnfair{display:block;color:#d8a13a;font-size:11px}
   #overviewScreen{display:none;gap:20px;margin-top:14px;min-height:calc(100vh - 80px)}
   #overviewScreen.on{display:flex}
   @media (max-width:960px){#overviewScreen{flex-direction:column-reverse}}
@@ -246,6 +253,17 @@
       row is two people marking the same clip &mdash; an aligner inside it is already as good
       as the humans judging it.</p>
     <div class="evScroll"><table class="ev" id="evTable"></table></div>
+    <div class="evWarn" id="evWarn" hidden></div>
+  </div>
+  <div class="ovCard">
+    <h2>Is the difference real?</h2>
+    <p class="evNote">Each test redraws the marked clips 2,000 times and scores both aligners on
+      the same draw, so an easy recording or a mumbling speaker cancels out instead of
+      swamping the difference. Clips are redrawn rather than single boundaries, because
+      boundaries in one clip share a speaker and a recording and are not independent. The
+      p-values are corrected for running several tests at once. <b>Grey rows could be chance;
+      mark more clips to narrow the intervals.</b></p>
+    <div class="evScroll"><table class="ev" id="evSig"></table></div>
   </div>
   <div class="ovCard">
     <h2>Boundaries within 100 ms</h2>
@@ -603,22 +621,42 @@ function renderEval(d){
   if(!ranked.length){
     $('evTable').innerHTML='<tr><td class="evEmpty">Nothing to score yet &mdash; mark a clip first.</td></tr>';
     $('evBars').innerHTML=''; $('evClips').innerHTML=''; $('evLegend').textContent='';
+    $('evSig').innerHTML=''; $('evWarn').hidden=true;
     return;
   }
-  const row=(name,s,cls)=>'<tr class="'+cls+'"><td><span class="evName">'+name+'</span>'
-    +(ALIGNER_DESC[name]?'<span class="evDesc">'+ALIGNER_DESC[name]+'</span>':'')+'</td>'
-    +'<td class="'+errClass(s.median_ms)+'">'+fmtMs(s.median_ms)+'</td>'
-    +'<td class="'+errClass(s.p90_ms)+'">'+fmtMs(s.p90_ms)+'</td>'
-    +'<td>'+s.within_20ms+'%</td><td>'+s.within_50ms+'%</td><td>'+s.within_100ms+'%</td>'
-    +'<td>'+(s.words_paired_pct!=null?s.words_paired_pct+'%':'&ndash;')+'</td></tr>';
-  let t='<tr><th>aligner</th><th>median</th><th>p90</th><th>&le;20 ms</th><th>&le;50 ms</th>'
-    +'<th>&le;100 ms</th><th>words paired</th></tr>';
-  ranked.forEach(([n,s],i)=>{ t+=row(n,s,i===0?'best':''); });
+  // A value with its 95% interval underneath, from resampling clips.
+  const withCi=(v,ci,unit)=>{
+    const main=(v==null?'&ndash;':(unit==='%'?v+'%':Math.round(v)+' ms'));
+    if(!ci) return main;
+    const lo=unit==='%'?ci[0]:Math.round(ci[0]), hi=unit==='%'?ci[1]:Math.round(ci[1]);
+    return main+'<span class="evCi">'+lo+'&ndash;'+hi+'</span>';
+  };
+  const TOL=[10,25,50,100];
+  const row=(name,s,cls)=>{
+    const ci=s.ci||{};
+    const seedTag=(name===d.seed)?'<span class="evSeed">marks started here &mdash; flattered</span>':'';
+    return '<tr class="'+cls+'"><td><span class="evName">'+name+'</span>'
+      +(ALIGNER_DESC[name]?'<span class="evDesc">'+ALIGNER_DESC[name]+'</span>':'')+seedTag+'</td>'
+      +'<td class="'+errClass(s.median_ms)+'">'+withCi(s.median_ms,ci.median_ms,'ms')+'</td>'
+      +'<td class="'+errClass(s.p90_ms)+'">'+withCi(s.p90_ms,ci.p90_ms,'ms')+'</td>'
+      +TOL.map(x=>'<td>'+withCi(s['within_'+x+'ms'],ci['within_'+x+'ms'],'%')+'</td>').join('')
+      +'<td>'+(s.unmoved_pct!=null?s.unmoved_pct+'%':'&ndash;')+'</td></tr>';
+  };
+  let t='<tr><th>aligner</th><th>median</th><th>p90</th>'
+    +TOL.map(x=>'<th>&le;'+x+' ms</th>').join('')
+    +'<th title="Human boundaries left exactly where this aligner put them">unmoved</th></tr>';
+  ranked.forEach(([n,s],i)=>{ t+=row(n,s,i===0&&n!==d.seed?'best':''); });
   const h=d.human_agreement;
-  if(h) t+='<tr class="floor"><td>two humans, same clip<span class="evDesc">'+h.boundaries
-    +' boundaries</span></td><td>'+fmtMs(h.median_ms)+'</td><td>'+fmtMs(h.p90_ms)+'</td><td>'
-    +h.within_20ms+'%</td><td>'+h.within_50ms+'%</td><td>'+h.within_100ms+'%</td><td></td></tr>';
+  if(h){
+    const hc=h.ci||{};
+    t+='<tr class="floor"><td>two humans, same clip<span class="evDesc">'+h.boundaries
+      +' boundaries, '+(h.clips||'?')+' clips</span></td><td>'+withCi(h.median_ms,hc.median_ms,'ms')
+      +'</td><td>'+withCi(h.p90_ms,hc.p90_ms,'ms')+'</td>'
+      +TOL.map(x=>'<td>'+withCi(h['within_'+x+'ms'],hc['within_'+x+'ms'],'%')+'</td>').join('')
+      +'<td></td></tr>';
+  }
   $('evTable').innerHTML=t;
+  renderSignificance(d);
 
   $('evBars').innerHTML=ranked.map(([n,s])=>'<div class="evBar"><span>'+n+'</span>'
     +'<div class="evTrack"><div class="evFill" style="width:'+s.within_100ms+'%"></div>'
@@ -643,6 +681,40 @@ function renderEval(d){
   $('evClips').querySelectorAll('tr.clip').forEach(tr=>{
     tr.onclick=()=>{ $('evalScreen').classList.remove('on'); $('evalLink').classList.remove('cur'); openClip(tr.dataset.id); };
   });
+}
+
+// The seed warning and the pairwise tests. Kept apart from the main table so the numbers
+// and the question "should I believe this ranking?" read as separate things.
+function renderSignificance(d){
+  const w=$('evWarn');
+  const seed=d.seed, ss=seed&&d.aligners&&d.aligners[seed];
+  if(ss && ss.unmoved_pct!=null){
+    w.hidden=false;
+    w.innerHTML='<b>Not a fair test for '+seed+'.</b> The tool opens every clip on '+seed
+      +'\'s boundaries, and '+ss.unmoved_pct+'% of the human boundaries were never moved. '
+      +'Each of those counts as '+seed+' being exactly right, whether anyone checked it or '
+      +'not, so its scores are flattered. Only comparisons between the other aligners are fair.';
+  } else w.hidden=true;
+
+  const tests=d.comparisons||[];
+  if(!tests.length){
+    $('evSig').innerHTML='<tr><td class="evEmpty">Needs at least two aligners scored on the same clips.</td></tr>';
+    return;
+  }
+  const label={p90_ms:'p90',within_50ms:'within 50 ms'};
+  let s='<tr><th>comparison</th><th>measure</th><th>difference</th><th>95% interval</th>'
+    +'<th>p (corrected)</th><th>verdict</th></tr>';
+  tests.forEach(t=>{
+    const unit=t.metric.startsWith('within_')?' pts':' ms';
+    const verdict=t.significant
+      ?'<span class="evYes">real &mdash; '+t.better+' is better</span>'
+      :'<span class="evNo">could be chance</span>';
+    const unfair=t.fair===false?'<span class="evUnfair">unfair: marks started from '+seed+'</span>':'';
+    s+='<tr><td>'+t.a+' vs '+t.b+unfair+'</td><td>'+(label[t.metric]||t.metric)+'</td>'
+      +'<td>'+(t.diff>0?'+':'')+t.diff+unit+'</td><td>'+t.ci[0]+' to '+t.ci[1]+'</td>'
+      +'<td>'+t.p_holm+'</td><td>'+verdict+'</td></tr>';
+  });
+  $('evSig').innerHTML=s;
 }
 
 async function showOverview(){

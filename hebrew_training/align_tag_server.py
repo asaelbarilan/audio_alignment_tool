@@ -31,6 +31,7 @@ import argparse
 import base64
 import http.client
 import io
+import hashlib
 import json
 import os
 import re
@@ -1409,6 +1410,10 @@ def load_saved(path: Path, clips: list[dict]) -> dict[int, list]:
     return out
 
 
+EVAL_CACHE: dict = {}
+EVAL_LOCK = threading.Lock()
+
+
 def make_handler(args, dataset: Dataset, clips):
     by_key = {clip_key(c): c for c in clips}
     for c in clips:
@@ -1548,8 +1553,20 @@ def make_handler(args, dataset: Dataset, clips):
                     for n in os.environ.get("EVAL_EXCLUDE", "probe").split(",")
                     if n.strip()
                 }
-                result = evaluate(clips, gold, exclude=exclude)
-                result["excluded"] = sorted(exclude)
+                # The bootstrap takes a few seconds and the answer only changes when someone
+                # saves a mark, so it is computed once per distinct set of marks.
+                fingerprint = hashlib.sha256(
+                    json.dumps([gold, sorted(exclude)], sort_keys=True, ensure_ascii=False)
+                    .encode("utf-8")
+                ).hexdigest()
+                with EVAL_LOCK:
+                    cached = EVAL_CACHE.get("result") if EVAL_CACHE.get("key") == fingerprint else None
+                if cached is None:
+                    cached = evaluate(clips, gold, exclude=exclude)
+                    cached["excluded"] = sorted(exclude)
+                    with EVAL_LOCK:
+                        EVAL_CACHE.update(key=fingerprint, result=cached)
+                result = cached
                 return self.send(
                     200,
                     json.dumps(result, ensure_ascii=False).encode("utf-8"),
