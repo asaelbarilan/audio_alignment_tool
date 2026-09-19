@@ -13,6 +13,14 @@
  .w.fixed{outline:1px solid #d8a13a}
  .w.added{outline:1px solid #4ec98a}
  button.danger{color:#e88}
+ #alnBar{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;margin:6px 0 4px;font-size:12px}
+ #alnBar[hidden]{display:none}
+ .alnLab{color:#8a8f98}
+ #alnToggles{display:inline-flex;flex-wrap:wrap;gap:4px 12px}
+ .alnT{display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:#c9ccd1;user-select:none}
+ .alnT input{margin:0;cursor:pointer}
+ .alnSw{display:inline-block;width:12px;height:4px;border-radius:2px}
+ #alnBar button{font-size:11px;padding:1px 7px}
  #dl{color:#6aa0ff;font-size:13px;text-decoration:none;align-self:center}
  #dl:hover{text-decoration:underline}
 .wedit{font:inherit;background:#14161a;color:#e8e8ea;border:1px solid #d8a13a;
@@ -168,6 +176,8 @@
   .evNo{color:#8a8f98}
   .evUnfair{display:block;color:#d8a13a;font-size:11px}
   .evRobust{display:block;color:#4ec98a;font-size:11px}
+  a.evOpen{color:#6aa0ff;text-decoration:none;font-size:12px;white-space:nowrap}
+  a.evOpen:hover{text-decoration:underline}
   #overviewScreen{display:none;gap:20px;margin-top:14px;min-height:calc(100vh - 80px)}
   #overviewScreen.on{display:flex}
   @media (max-width:960px){#overviewScreen{flex-direction:column-reverse}}
@@ -381,6 +391,8 @@
     <span class="key"><i class="sw" style="background:#6aa0ff"></i>your marks</span>
     <span class="key"><i class="sw" style="background:#ff5f56"></i>playhead</span>
   </span></div>
+<div id="alnBar" hidden><span class="alnLab">compare aligners:</span><span id="alnToggles"></span>
+  <button id="alnAll" type="button">all</button><button id="alnNone" type="button">none</button></div>
 <canvas id="wave"></canvas>
 <canvas id="zm"></canvas>
 <div id="scroll"><div id="thumb"></div></div>
@@ -675,15 +687,23 @@ function renderEval(d){
     const vals=names.map(n=>c[n]).filter(v=>v!=null);
     return {id,c,worst:vals.length?Math.max(...vals):-1};
   }).sort((a,b)=>b.worst-a.worst);
-  let ct='<tr><th>clip</th><th>recording</th>'+names.map(n=>'<th>'+n+'</th>').join('')+'</tr>';
+  let ct='<tr><th></th><th>clip</th><th>recording</th>'+names.map(n=>'<th>'+n+'</th>').join('')+'</tr>';
   clipsRows.forEach(({id,c})=>{
-    ct+='<tr class="clip" data-id="'+id+'"><td><span class="evText">'
+    ct+='<tr class="clip" data-id="'+id+'"><td><a class="evOpen" href="?clip='+encodeURIComponent(id)
+      +'&aligners=all" title="Open this clip with every aligner shown">open &#9656;</a></td><td><span class="evText">'
       +String(c._text||'').replace(/</g,'&lt;')+'</span></td><td>'+(c._recording||'')+'</td>'
       +names.map(n=>'<td class="'+errClass(c[n])+'">'+fmtMs(c[n])+'</td>').join('')+'</tr>';
   });
   $('evClips').innerHTML=ct;
   $('evClips').querySelectorAll('tr.clip').forEach(tr=>{
-    tr.onclick=()=>{ $('evalScreen').classList.remove('on'); $('evalLink').classList.remove('cur'); openClip(tr.dataset.id); };
+    tr.onclick=e=>{
+      // A plain click opens in place; ctrl/cmd-click on the link opens a new tab as usual.
+      if(e.target.closest('a')&&(e.ctrlKey||e.metaKey||e.shiftKey)) return;
+      e.preventDefault();
+      alnForceAll=true; alnSig=null;
+      $('evalScreen').classList.remove('on'); $('evalLink').classList.remove('cur');
+      openClip(tr.dataset.id);
+    };
   });
 }
 
@@ -1335,12 +1355,76 @@ function buildPeaks(w){
     for(let i=s;i<e;i++){const v=d[i];if(v<lo)lo=v;if(v>hi)hi=v;}
     peaks[x*2]=lo;peaks[x*2+1]=hi;}
 }
+// ---- aligner lanes -------------------------------------------------------------------
+// Every aligner's own word boundaries for this clip, each in its own thin lane under your
+// marks, so where each one disagrees with you -- and with each other -- is visible directly
+// instead of only as a number on the eval page. Which lanes are on is remembered per browser.
+const ALN_COLORS={mms:'#4ec98a','ivrit-ai':'#d8a13a',stable_ts_turbo:'#c678dd',stable_ts:'#c678dd',
+  hebrew:'#e06c6c',mwa:'#56b6c2'};
+const ALN_FALLBACK=['#e5c07b','#61afef','#98c379','#be5046','#abb2bf'];
+function alnColor(src,i){ return ALN_COLORS[src]||ALN_FALLBACK[i%ALN_FALLBACK.length]; }
+let alnShown=new Set(), alnSig=null;
+try{ alnShown=new Set(JSON.parse(localStorage.getItem('alnShown')||'[]')); }catch(e){}
+// Opened from the eval dashboard: show every aligner, since comparing them is why you came.
+const ALN_ALL_FROM_URL=(new URLSearchParams(location.search).get('aligners')==='all');
+let alnForceAll=ALN_ALL_FROM_URL;
+function saveAln(){ try{ localStorage.setItem('alnShown',JSON.stringify([...alnShown])); }catch(e){} }
+
+function clipLabels(){
+  const d=(currentClipDetail&&currentClipDetail.labels)?currentClipDetail:(clips&&clips[ci]);
+  return (d&&d.labels)||[];
+}
+// Rebuilt only when the set of aligners changes, so it can be called from draw() cheaply.
+function renderAlnToggles(){
+  const labels=clipLabels();
+  const sig=labels.map(l=>l.source).join('|');
+  if(sig===alnSig) return;
+  alnSig=sig;
+  if(alnForceAll){ labels.forEach(l=>alnShown.add(l.source)); alnForceAll=false; saveAln(); }
+  $('alnBar').hidden=!labels.length;
+  $('alnToggles').innerHTML=labels.map((l,i)=>'<label class="alnT"><input type="checkbox" data-src="'
+    +l.source+'"'+(alnShown.has(l.source)?' checked':'')+'><i class="alnSw" style="background:'
+    +alnColor(l.source,i)+'"></i>'+l.source+'</label>').join('');
+  $('alnToggles').querySelectorAll('input').forEach(cb=>{
+    cb.onchange=()=>{ cb.checked?alnShown.add(cb.dataset.src):alnShown.delete(cb.dataset.src); saveAln(); draw(); };
+  });
+}
+function setAllAln(on){
+  clipLabels().forEach(l=>on?alnShown.add(l.source):alnShown.delete(l.source));
+  saveAln(); alnSig=null; renderAlnToggles(); draw();
+}
+
+// Paint the enabled lanes into the band [y0, y1) of a canvas, using its own time->x map.
+function paintAlnLanes(g,X,y0,y1,w,withNames){
+  const lanes=clipLabels().map((l,i)=>({l,i})).filter(o=>alnShown.has(o.l.source));
+  if(!lanes.length) return;
+  const laneH=(y1-y0)/lanes.length;
+  lanes.forEach(({l,i},k)=>{
+    const col=alnColor(l.source,i), top=y0+k*laneH, bh=Math.max(2,laneH-2);
+    g.globalAlpha=.55; g.fillStyle=col;
+    l.words.forEach(wd=>{ const a=X(wd.start), b=X(wd.end); if(b<0||a>w) return;
+      g.fillRect(a,top,Math.max(1,b-a),bh); });
+    g.globalAlpha=1;
+    // bright ticks at every boundary, so start and end read exactly
+    l.words.forEach(wd=>{ [wd.start,wd.end].forEach(t=>{ const x=X(t); if(x>=0&&x<=w) g.fillRect(Math.round(x),top,1,bh); }); });
+    if(withNames&&laneH>=8){
+      g.font='10px system-ui,sans-serif'; g.textBaseline='middle';
+      const tw=g.measureText(l.source).width+8;
+      g.fillStyle='rgba(20,22,26,.85)'; g.fillRect(w-tw-2,top,tw,bh);
+      g.fillStyle=col; g.fillText(l.source,w-tw+2,top+bh/2);
+    }
+  });
+  g.globalAlpha=1;
+}
+
 function drawOverview(){
   const w=ov.clientWidth,h=90; ov.width=w*devicePixelRatio; ov.height=h*devicePixelRatio;
   og.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0); og.clearRect(0,0,w,h);
   if(!buf)return;
   if(!peaks||peaks.length!==w*2) buildPeaks(w);
   const dur=buf.duration, X=t=>(t+lead)/dur*w;
+  renderAlnToggles();
+  paintAlnLanes(og,X,h*.80,h,w,false);
   gold.forEach((wd,i)=>{ og.fillStyle=(i===wi)?'rgba(61,111,214,.30)':'rgba(255,255,255,.03)';
     og.fillRect(X(wd.start),0,Math.max(1,X(wd.end)-X(wd.start)),h); });
   og.fillStyle='#2f3540';
@@ -1784,6 +1868,9 @@ function drawZoom(){
     zg.strokeStyle='#4ec98a'; zg.lineWidth=1;
     zg.strokeRect(Math.min(x0,x1)+0.5,0.5,Math.max(1,Math.abs(x1-x0))-1,h-1);
   }
+
+  // 2c. Aligner lanes, below your marks and above the time ticks
+  paintAlnLanes(zg,X,h*0.72,h-12,w,true);
 
   // 3. Time ticks at bottom
   zg.fillStyle='#2b303a';
@@ -3145,6 +3232,8 @@ $('ovFilterUser').onchange=renderOverviewList;
 $('ovSort').onchange=renderOverviewList;
 $('ovSearch').oninput=renderOverviewList;
 $('overviewLink').onclick=e=>{ e.preventDefault(); showOverview(); };
+$('alnAll').onclick=()=>setAllAln(true);
+$('alnNone').onclick=()=>setAllAln(false);
 $('evalLink').onclick=e=>{ e.preventDefault(); showEval(); };
 $('taggingLink').onclick=e=>{ e.preventDefault(); backToTagging(); };
 addEventListener('popstate',()=>{
