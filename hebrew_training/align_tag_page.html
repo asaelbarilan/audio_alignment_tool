@@ -167,6 +167,7 @@
   .evYes{color:#4ec98a;font-weight:600}
   .evNo{color:#8a8f98}
   .evUnfair{display:block;color:#d8a13a;font-size:11px}
+  .evRobust{display:block;color:#4ec98a;font-size:11px}
   #overviewScreen{display:none;gap:20px;margin-top:14px;min-height:calc(100vh - 80px)}
   #overviewScreen.on{display:flex}
   @media (max-width:960px){#overviewScreen{flex-direction:column-reverse}}
@@ -709,7 +710,9 @@ function renderSignificance(d){
     const verdict=t.significant
       ?'<span class="evYes">real &mdash; '+t.better+' is better</span>'
       :'<span class="evNo">could be chance</span>';
-    const unfair=t.fair===false?'<span class="evUnfair">unfair: marks started from '+seed+'</span>':'';
+    const unfair=t.fair===false
+      ?'<span class="evUnfair">unfair: marks started from '+seed+'</span>'
+      :(t.seed_lost_anyway?'<span class="evRobust">holds despite '+seed+'\'s head start</span>':'');
     s+='<tr><td>'+t.a+' vs '+t.b+unfair+'</td><td>'+(label[t.metric]||t.metric)+'</td>'
       +'<td>'+(t.diff>0?'+':'')+t.diff+unit+'</td><td>'+t.ci[0]+' to '+t.ci[1]+'</td>'
       +'<td>'+t.p_holm+'</td><td>'+verdict+'</td></tr>';
