@@ -1529,6 +1529,32 @@ def make_handler(args, dataset: Dataset, clips):
                         json.dumps({"error": str(exc), "message": str(exc)}).encode("utf-8"),
                         "application/json",
                     )
+            if route == "/api/eval":
+                # The same rows /api/export hands out, scored by the same module the local
+                # script uses -- so the dashboard and a downloaded file cannot disagree.
+                from hebrew_training.aligner_eval import evaluate
+
+                gold = []
+                if STORE is not None:
+                    for name, payload in STORE.everything():
+                        gold += [{**row, "annotator": name} for row in payload]
+                else:
+                    for f in sorted(args.out.glob("*.jsonl")):
+                        for line in f.read_text(encoding="utf-8").splitlines():
+                            if line.strip():
+                                gold.append({**json.loads(line), "annotator": f.stem})
+                exclude = {
+                    n.strip()
+                    for n in os.environ.get("EVAL_EXCLUDE", "probe").split(",")
+                    if n.strip()
+                }
+                result = evaluate(clips, gold, exclude=exclude)
+                result["excluded"] = sorted(exclude)
+                return self.send(
+                    200,
+                    json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
             if route == "/api/export":
                 # The marks live in Postgres once hosted, but the rest of the pipeline reads
                 # jsonl keyed on clip id. So export in exactly that shape, with the

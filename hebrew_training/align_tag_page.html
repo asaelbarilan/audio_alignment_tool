@@ -130,6 +130,36 @@
   #overviewLink, #taggingLink{color:#6aa0ff;text-decoration:none;font-size:13px;font-weight:500;cursor:pointer}
   #overviewLink:hover, #taggingLink:hover{text-decoration:underline;color:#8cb7ff}
   #overviewLink.cur{color:#fff;font-weight:bold;text-decoration:underline}
+  #evalLink.cur{color:#fff;font-weight:bold;text-decoration:underline}
+  #evalScreen{display:none;margin-top:14px;max-width:1100px}
+  #evalScreen.on{display:block}
+  #evalScreen .ovCard{margin-bottom:16px}
+  #evalScreen h2{font-size:16px;margin:0 0 6px}
+  .evNote{color:#8a8f98;font-size:12.5px;line-height:1.55;margin:0 0 12px}
+  .evScroll{overflow-x:auto}
+  table.ev{border-collapse:collapse;width:100%;font-size:13px}
+  table.ev th{color:#8a8f98;font-weight:500;text-align:right;padding:7px 10px;
+              border-bottom:1px solid #2a2e37;white-space:nowrap}
+  table.ev th:first-child,table.ev td:first-child{text-align:left}
+  table.ev td{padding:7px 10px;border-bottom:1px solid #22262e;text-align:right;
+              font-variant-numeric:tabular-nums;white-space:nowrap}
+  table.ev tr.best td:first-child{color:#4ec98a;font-weight:600}
+  table.ev tr.floor td{color:#8a8f98;font-style:italic;border-top:1px dashed #3a3f4a}
+  .evName{font-weight:600}
+  .evDesc{display:block;color:#6f757f;font-size:11.5px;font-weight:400}
+  .evGood{color:#4ec98a}.evMid{color:#d8a13a}.evBad{color:#e06c6c}
+  .evBars{display:flex;flex-direction:column;gap:9px;margin-top:4px}
+  .evBar{display:grid;grid-template-columns:110px 1fr 56px;align-items:center;gap:10px;
+         font-size:12.5px}
+  .evTrack{position:relative;height:18px;background:#14161a;border-radius:4px}
+  .evFill{position:absolute;left:0;top:0;bottom:0;background:#3d6fd6;border-radius:4px}
+  .evFloor{position:absolute;top:-4px;bottom:-4px;width:2px;background:#e8e8ea;opacity:.7}
+  .evLegend{color:#8a8f98;font-size:11.5px;margin-top:8px}
+  table.ev tr.clip{cursor:pointer}
+  table.ev tr.clip:hover td{background:#22262e}
+  .evText{direction:rtl;text-align:right;max-width:300px;overflow:hidden;
+          text-overflow:ellipsis;display:inline-block;vertical-align:bottom}
+  .evEmpty{color:#8a8f98;padding:18px 0}
   #overviewScreen{display:none;gap:20px;margin-top:14px;min-height:calc(100vh - 80px)}
   #overviewScreen.on{display:flex}
   @media (max-width:960px){#overviewScreen{flex-direction:column-reverse}}
@@ -198,11 +228,35 @@
 <div class="top"><h1>Hebrew alignment tagging</h1><div id="bar"></div><div id="me"></div>
   <span id="navLinks" style="display:inline-flex;gap:12px;align-items:center">
     <a id="overviewLink" href="#">overview</a>
+    <a id="evalLink" href="#">aligner eval</a>
     <a id="taggingLink" href="#" style="display:none">back to tagging</a>
   </span>
   <span id="sampleBadge" style="display:none">viewing local sample</span>
   <button id="uploadSampleBtn" title="Load a local CSV + WAV pair for viewing, no server involved">upload sample</button>
   <button id="removeSampleBtn" style="display:none">remove sample</button>
+</div>
+
+<div id="evalScreen">
+  <div class="ovCard">
+    <h2>Aligner evaluation</h2>
+    <p class="evNote" id="evSummary">Loading...</p>
+    <p class="evNote">Boundary error is how far an aligner put a word's start and end from
+      where a person marked it. <b>Rank by p90, not the median</b>: an aligner that is usually
+      close but sometimes half a second out still cuts training clips mid-word. The dashed
+      row is two people marking the same clip &mdash; an aligner inside it is already as good
+      as the humans judging it.</p>
+    <div class="evScroll"><table class="ev" id="evTable"></table></div>
+  </div>
+  <div class="ovCard">
+    <h2>Boundaries within 100 ms</h2>
+    <div class="evBars" id="evBars"></div>
+    <div class="evLegend" id="evLegend"></div>
+  </div>
+  <div class="ovCard">
+    <h2>Per clip &mdash; worst first</h2>
+    <p class="evNote">Median error per aligner on each clip. Click a clip to open it.</p>
+    <div class="evScroll"><table class="ev" id="evClips"></table></div>
+  </div>
 </div>
 
 <div id="overviewScreen">
@@ -513,8 +567,88 @@ function setUrlParam(key, val){
   history.pushState(null,'',u.pathname+u.search);
 }
 
+// What each aligner is, so the table reads without a lookup.
+const ALIGNER_DESC={
+  hebrew:'wav2vec2 Hebrew CTC (imvladikon)',
+  mms:'Meta MMS forced aligner',
+  stable_ts:"ivrit.ai's shipped timings (Whisper + stable-ts)",
+};
+const fmtMs=v=>(v==null?'&ndash;':Math.round(v)+' ms');
+const errClass=v=>v==null?'':(v<=50?'evGood':(v<=100?'evMid':'evBad'));
+
+async function showEval(){
+  stop(); cancelAlign();
+  $('workspace').style.display='none';
+  $('overviewScreen').classList.remove('on');
+  $('overviewLink').classList.remove('cur');
+  $('evalScreen').classList.add('on');
+  $('evalLink').classList.add('cur');
+  $('taggingLink').style.display='';
+  setUrlParam('view','eval');
+  setUrlParam('clip',null);
+  let r;
+  try{ r=await fetch(api('/api/eval')); }catch(e){ $('evSummary').textContent='Could not reach the server.'; return; }
+  if(!r.ok){ $('evSummary').textContent='Could not load the evaluation ('+r.status+').'; return; }
+  renderEval(await r.json());
+}
+
+function renderEval(d){
+  const people=Object.entries(d.annotators||{}).map(([n,c])=>n+' '+c).join(', ');
+  $('evSummary').innerHTML=d.marked_clips
+    ? '<b>'+d.marked_clips+'</b> clips marked by '+people
+      +(d.excluded&&d.excluded.length?' &middot; excluded: '+d.excluded.join(', '):'')
+    : 'No marked clips yet.';
+  const ranked=Object.entries(d.aligners||{}).filter(([,s])=>s.boundaries)
+    .sort((a,b)=>a[1].p90_ms-b[1].p90_ms);
+  if(!ranked.length){
+    $('evTable').innerHTML='<tr><td class="evEmpty">Nothing to score yet &mdash; mark a clip first.</td></tr>';
+    $('evBars').innerHTML=''; $('evClips').innerHTML=''; $('evLegend').textContent='';
+    return;
+  }
+  const row=(name,s,cls)=>'<tr class="'+cls+'"><td><span class="evName">'+name+'</span>'
+    +(ALIGNER_DESC[name]?'<span class="evDesc">'+ALIGNER_DESC[name]+'</span>':'')+'</td>'
+    +'<td class="'+errClass(s.median_ms)+'">'+fmtMs(s.median_ms)+'</td>'
+    +'<td class="'+errClass(s.p90_ms)+'">'+fmtMs(s.p90_ms)+'</td>'
+    +'<td>'+s.within_20ms+'%</td><td>'+s.within_50ms+'%</td><td>'+s.within_100ms+'%</td>'
+    +'<td>'+(s.words_paired_pct!=null?s.words_paired_pct+'%':'&ndash;')+'</td></tr>';
+  let t='<tr><th>aligner</th><th>median</th><th>p90</th><th>&le;20 ms</th><th>&le;50 ms</th>'
+    +'<th>&le;100 ms</th><th>words paired</th></tr>';
+  ranked.forEach(([n,s],i)=>{ t+=row(n,s,i===0?'best':''); });
+  const h=d.human_agreement;
+  if(h) t+='<tr class="floor"><td>two humans, same clip<span class="evDesc">'+h.boundaries
+    +' boundaries</span></td><td>'+fmtMs(h.median_ms)+'</td><td>'+fmtMs(h.p90_ms)+'</td><td>'
+    +h.within_20ms+'%</td><td>'+h.within_50ms+'%</td><td>'+h.within_100ms+'%</td><td></td></tr>';
+  $('evTable').innerHTML=t;
+
+  $('evBars').innerHTML=ranked.map(([n,s])=>'<div class="evBar"><span>'+n+'</span>'
+    +'<div class="evTrack"><div class="evFill" style="width:'+s.within_100ms+'%"></div>'
+    +(h?'<div class="evFloor" style="left:'+h.within_100ms+'%"></div>':'')+'</div>'
+    +'<span>'+s.within_100ms+'%</span></div>').join('');
+  $('evLegend').textContent=h
+    ? 'White line: two people on the same clip agree within 100 ms on '+h.within_100ms+'% of boundaries.'
+    : 'No clip has been marked by two people yet, so there is no human reference line.';
+
+  const names=ranked.map(([n])=>n);
+  const clipsRows=Object.entries(d.clips||{}).map(([id,c])=>{
+    const vals=names.map(n=>c[n]).filter(v=>v!=null);
+    return {id,c,worst:vals.length?Math.max(...vals):-1};
+  }).sort((a,b)=>b.worst-a.worst);
+  let ct='<tr><th>clip</th><th>recording</th>'+names.map(n=>'<th>'+n+'</th>').join('')+'</tr>';
+  clipsRows.forEach(({id,c})=>{
+    ct+='<tr class="clip" data-id="'+id+'"><td><span class="evText">'
+      +String(c._text||'').replace(/</g,'&lt;')+'</span></td><td>'+(c._recording||'')+'</td>'
+      +names.map(n=>'<td class="'+errClass(c[n])+'">'+fmtMs(c[n])+'</td>').join('')+'</tr>';
+  });
+  $('evClips').innerHTML=ct;
+  $('evClips').querySelectorAll('tr.clip').forEach(tr=>{
+    tr.onclick=()=>{ $('evalScreen').classList.remove('on'); $('evalLink').classList.remove('cur'); openClip(tr.dataset.id); };
+  });
+}
+
 async function showOverview(){
   stop(); cancelAlign();
+  $('evalScreen').classList.remove('on');
+  $('evalLink').classList.remove('cur');
   $('workspace').style.display='none';
   $('overviewScreen').classList.add('on');
   $('overviewLink').classList.add('cur');
@@ -717,6 +851,8 @@ async function openClip(key, forceReadOnly){
   isReadOnly=(forceReadOnly || !isMine);
 
   $('overviewScreen').classList.remove('on');
+  $('evalScreen').classList.remove('on');
+  $('evalLink').classList.remove('cur');
   $('workspace').style.display='block';
   $('overviewLink').classList.remove('cur');
   $('taggingLink').style.display='';
@@ -828,6 +964,8 @@ async function backToTagging(){
   currentClipDetail=null;
   $('readOnlyBanner').style.display='none';
   $('overviewScreen').classList.remove('on');
+  $('evalScreen').classList.remove('on');
+  $('evalLink').classList.remove('cur');
   $('workspace').style.display='block';
   $('overviewLink').classList.remove('cur');
   $('taggingLink').style.display='none';
@@ -929,6 +1067,10 @@ async function load(){
   if(v==='overview'){
     PARAMS.delete('view');
     return showOverview();
+  }
+  if(v==='eval'){
+    PARAMS.delete('view');
+    return showEval();
   }
   if(cl){
     PARAMS.delete('clip');
@@ -2922,12 +3064,14 @@ $('ovFilterUser').onchange=renderOverviewList;
 $('ovSort').onchange=renderOverviewList;
 $('ovSearch').oninput=renderOverviewList;
 $('overviewLink').onclick=e=>{ e.preventDefault(); showOverview(); };
+$('evalLink').onclick=e=>{ e.preventDefault(); showEval(); };
 $('taggingLink').onclick=e=>{ e.preventDefault(); backToTagging(); };
 addEventListener('popstate',()=>{
   const p=new URLSearchParams(location.search);
   const v=p.get('view');
   const c=p.get('clip');
   if(v==='overview') showOverview();
+  else if(v==='eval') showEval();
   else if(c) openClip(c);
   else backToTagging();
 });
