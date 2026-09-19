@@ -1072,6 +1072,7 @@ async function openClip(key, forceReadOnly){
   }
 
   await loadClip();
+  startTick();
 }
 
 async function backToTagging(){
@@ -1198,7 +1199,7 @@ async function load(){
   for(let i=0;i<clips.length;i++) if(clips[i].saved && !clips[i].done) ci=i;
   if(ci<0) ci=clips.findIndex(c=>!c.saved);
   if(ci<0) ci=0;
-  await loadClip(); tick();
+  await loadClip(); startTick();
 }
 async function loadClip(){
   stop();
@@ -2004,6 +2005,11 @@ function updatePlayingChip(){
   playingIdx=idx;
   if(idx>=0&&chips[idx]) chips[idx].classList.add('playing');
 }
+// The loop that moves the playhead. It used to be started only by the tagging path, so a
+// clip opened straight from the overview or the eval table never animated: the audio played
+// and the red line sat still. Guarded, so entering a clip twice does not run two loops.
+let ticking=false;
+function startTick(){ if(ticking) return; ticking=true; tick(); }
 function tick(){ if(playing)draw();
   $('clock').textContent=mmss(now())+' / '+mmss(total()); updatePlayingChip();
   requestAnimationFrame(tick); }
