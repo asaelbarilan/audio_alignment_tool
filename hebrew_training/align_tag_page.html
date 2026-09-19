@@ -610,12 +610,11 @@ function setUrlParam(key, val){
 
 // What each aligner is, so the table reads without a lookup.
 const ALIGNER_DESC={
-  hebrew:'wav2vec2 Hebrew CTC (imvladikon)',
-  mms:'Meta MMS forced aligner',
-  stable_ts:"ivrit.ai's shipped timings (Whisper + stable-ts)",
-  'ivrit-ai':'timings shipped with the ivrit.ai dataset',
-  mwa:'Multilingual Word Aligner (arXiv 2606.10675) &mdash; the align button',
-  stable_ts_turbo:'stable-ts align on faster-whisper, ivrit.ai large-v3-turbo',
+  'wav2vec2-hebrew':'CTC forced alignment &mdash; imvladikon/wav2vec2-xls-r-300m-hebrew',
+  mms:'CTC forced alignment &mdash; Meta MMS, 1,130 languages, romanized',
+  'whisper-stable-ts':'stable-ts align on faster-whisper &mdash; ivrit.ai whisper-large-v3-turbo',
+  'mwa-buckeye':'Multilingual Word Aligner, buckeye checkpoint (arXiv 2606.10675) &mdash; the align button',
+  'ivrit-ai':'timings shipped with the dataset (Whisper + stable-ts), not re-run here',
 };
 const fmtMs=v=>(v==null?'&ndash;':Math.round(v)+' ms');
 const errClass=v=>v==null?'':(v<=50?'evGood':(v<=100?'evMid':'evBad'));
@@ -1375,8 +1374,8 @@ function buildPeaks(w){
 // Every aligner's own word boundaries for this clip, each in its own thin lane under your
 // marks, so where each one disagrees with you -- and with each other -- is visible directly
 // instead of only as a number on the eval page. Which lanes are on is remembered per browser.
-const ALN_COLORS={mms:'#4ec98a','ivrit-ai':'#d8a13a',stable_ts_turbo:'#c678dd',stable_ts:'#c678dd',
-  hebrew:'#e06c6c',mwa:'#56b6c2'};
+const ALN_COLORS={mms:'#4ec98a','ivrit-ai':'#d8a13a','whisper-stable-ts':'#c678dd',
+  'wav2vec2-hebrew':'#e06c6c','mwa-buckeye':'#56b6c2'};
 const ALN_FALLBACK=['#e5c07b','#61afef','#98c379','#be5046','#abb2bf'];
 function alnColor(src,i){ return ALN_COLORS[src]||ALN_FALLBACK[i%ALN_FALLBACK.length]; }
 let alnShown=new Set(), alnSig=null;
