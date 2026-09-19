@@ -2497,12 +2497,18 @@ function attachZoomEvents(canvas){
     }
     const inOverlayZone = (canvas !== zm) || (e.clientY >= r.top + r.height * 0.30 && e.clientY <= r.top + r.height * 0.70);
     if(inOverlayZone){
-      // nearest mark across ALL words, so any of them can be grabbed without switching first
+      // nearest mark across ALL words, so any of them can be grabbed without switching first.
+      // When two marks land on (essentially) the same pixel -- words flush with no gap between
+      // them -- always prefer the already-selected word's own marker over its neighbour's: the
+      // user selected that word to work on it, and iteration order over `gold` shouldn't
+      // silently hand the drag to whichever neighbour happens to be touching it instead.
+      const TIE_PX=1;                     // marks within this many px count as "same place"
       let best=null;
       gold.forEach((wd,i)=>{
         [['start',wd.start],['end',wd.end]].forEach(([which,t])=>{
           const d=Math.abs(px(t)-e.clientX);
-          if(!best||d<best.d) best={d,i,which};
+          const tie=best&&Math.abs(d-best.d)<=TIE_PX;
+          if(!best||d<best.d-TIE_PX||(tie&&i===wi&&best.i!==wi)) best={d,i,which};
         });
       });
       // inside a word, away from its marks: drag the whole word, both marks together

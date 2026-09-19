@@ -22,3 +22,26 @@ the annotator's current marks with the result. Needs `ENDPOINT_ID` and `RP_API_K
 `RUNPOD_API_KEY`) in the environment; without them the button returns "Aligner disabled".
 Optional: `ALIGNER_MODEL_NAME` (must match whichever model the endpoint was deployed with)
 and `ALIGNER_LANGUAGE` (default `heb`).
+
+# Tagging Guidance
+
+## How to match text to speech
+- convert numbers/values/dates to spoken words (1970, 2.5, 5%, 14:30 etc.)
+- Add words which are spoken and not in text
+- Remove words which are not spoken, or partially spoken (either speaker stopped mid-word or the word cuts off or start mid word in the audio sample)
+- Use the proper text form of words even if the speaker mispronounces or stutters mid word - don't make up "literal speech representations" - the task it to align proper text to audio
+
+## Multiple Speakers
+- When overlapping - choose those most dominant speaker sequence and carry on with that ignoring the background overlapping words.
+- When a word, even by a different speaker is clearly spoken and no other dominant speakers words - time that word even if the sentence does not makes sense
+- If a speaker is interrupted and yields so the other speaker clearly speaks - time the interruption words
+
+
+## Efficiency and Helpers
+- Use speech segmentation lines
+- Start by listening to all clip - and adapt the text (add, remove, modify words) to the spoken audio
+- Lean the "Shift" modifiers to quickly adapt word start/end timings (control the small, med, big increments sizes)
+
+
+## Quality Control
+- Before marking done - play the entire clip and watch the highlights - get a "feel" that all words are in sync with audio
