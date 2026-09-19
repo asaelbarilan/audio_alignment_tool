@@ -634,10 +634,25 @@ async function showEval(){
   $('evDlMarks').href=api('/api/export');
   const res=api('/api/eval');
   $('evDlResults').href=res+(res.includes('?')?'&':'?')+'download=1';
-  let r;
-  try{ r=await fetch(api('/api/eval')); }catch(e){ $('evSummary').textContent='Could not reach the server.'; return; }
-  if(!r.ok){ $('evSummary').textContent='Could not load the evaluation ('+r.status+').'; return; }
-  renderEval(await r.json());
+  // The server computes in a worker and answers "computing" until it is done, so a slow
+  // first run cannot sit on an open connection until a gateway gives up.
+  const started=Date.now();
+  for(;;){
+    let r, d;
+    try{ r=await fetch(api('/api/eval')); }
+    catch(e){ $('evSummary').textContent='Could not reach the server.'; return; }
+    if(!r.ok){ $('evSummary').textContent='Could not load the evaluation ('+r.status+').'; return; }
+    try{ d=await r.json(); }
+    catch(e){ $('evSummary').textContent='The server sent something unreadable.'; return; }
+    if(d.status==='error'){ $('evSummary').textContent='The evaluation failed: '+d.error; return; }
+    if(d.status!=='computing'){ renderEval(d); return; }
+    if(Date.now()-started>300000){ $('evSummary').textContent='The evaluation is taking too long; check the server log.'; return; }
+    const secs=Math.round((Date.now()-started)/1000);
+    $('evSummary').textContent='Scoring '+(d.clips||'')+' clips and running the significance tests'
+      +' — first time only, then it is cached ('+secs+'s)';
+    if(document.getElementById('evalScreen') && !document.getElementById('evalScreen').classList.contains('on')) return;
+    await new Promise(r=>setTimeout(r,2000));
+  }
 }
 
 function renderEval(d){

@@ -1553,19 +1553,47 @@ def make_handler(args, dataset: Dataset, clips):
                     for n in os.environ.get("EVAL_EXCLUDE", "probe").split(",")
                     if n.strip()
                 }
-                # The bootstrap takes a few seconds and the answer only changes when someone
-                # saves a mark, so it is computed once per distinct set of marks.
+                # The bootstrap takes tens of seconds and the answer only changes when
+                # someone saves a mark, so it is computed once per distinct set of marks --
+                # and in a worker, never in the request. Holding the connection open for it
+                # leaves the page on "Loading..." for as long as the platform's gateway
+                # allows, then kills it with no error to show.
                 fingerprint = hashlib.sha256(
                     json.dumps([gold, sorted(exclude)], sort_keys=True, ensure_ascii=False)
                     .encode("utf-8")
                 ).hexdigest()
+
+                def compute():
+                    try:
+                        out = evaluate(clips, gold, exclude=exclude)
+                        out["excluded"] = sorted(exclude)
+                        with EVAL_LOCK:
+                            EVAL_CACHE.update(key=fingerprint, result=out, error=None)
+                    except Exception as exc:  # noqa: BLE001 -- report it, do not lose it
+                        with EVAL_LOCK:
+                            EVAL_CACHE.update(key=fingerprint, result=None,
+                                              error=f"{type(exc).__name__}: {exc}")
+                    finally:
+                        with EVAL_LOCK:
+                            EVAL_CACHE["running"] = None
+
                 with EVAL_LOCK:
-                    cached = EVAL_CACHE.get("result") if EVAL_CACHE.get("key") == fingerprint else None
+                    hit = EVAL_CACHE.get("key") == fingerprint
+                    cached = EVAL_CACHE.get("result") if hit else None
+                    failed = EVAL_CACHE.get("error") if hit else None
+                    busy = EVAL_CACHE.get("running") == fingerprint
+                    if cached is None and failed is None and not busy:
+                        EVAL_CACHE["running"] = fingerprint
+                        busy = True
+                        threading.Thread(target=compute, daemon=True).start()
                 if cached is None:
-                    cached = evaluate(clips, gold, exclude=exclude)
-                    cached["excluded"] = sorted(exclude)
-                    with EVAL_LOCK:
-                        EVAL_CACHE.update(key=fingerprint, result=cached)
+                    body = ({"status": "error", "error": failed} if failed
+                            else {"status": "computing", "clips": len(clips)})
+                    return self.send(
+                        200,
+                        json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                        "application/json; charset=utf-8",
+                    )
                 result = cached
                 from urllib.parse import parse_qs
 
