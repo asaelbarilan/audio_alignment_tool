@@ -176,6 +176,11 @@
   .evNo{color:#8a8f98}
   .evUnfair{display:block;color:#d8a13a;font-size:11px}
   .evRobust{display:block;color:#4ec98a;font-size:11px}
+  .evDl{display:flex;flex-wrap:wrap;align-items:center;gap:6px 16px;margin:0 0 12px;font-size:12.5px}
+  .evDl a{color:#6aa0ff;text-decoration:none}
+  .evDl a:hover{text-decoration:underline}
+  .evDlNote{color:#6f757f;font-size:11.5px}
+  .evDlNote code{color:#8a8f98}
   a.evOpen{color:#6aa0ff;text-decoration:none;font-size:12px;white-space:nowrap}
   a.evOpen:hover{text-decoration:underline}
   #overviewScreen{display:none;gap:20px;margin-top:14px;min-height:calc(100vh - 80px)}
@@ -258,6 +263,11 @@
   <div class="ovCard">
     <h2>Aligner evaluation</h2>
     <p class="evNote" id="evSummary">Loading...</p>
+    <div class="evDl">
+      <a id="evDlMarks" href="#" download="gold.jsonl">&#8595; download marks (.jsonl)</a>
+      <a id="evDlResults" href="#" download="aligner_eval.json">&#8595; download results (.json)</a>
+      <span class="evDlNote">Re-run offline on the marks file: <code>eval/run_eval.py</code> (see eval/README.md)</span>
+    </div>
     <p class="evNote">Boundary error is how far an aligner put a word's start and end from
       where a person marked it. <b>Rank by p90, not the median</b>: an aligner that is usually
       close but sometimes half a second out still cuts training clips mid-word. The dashed
@@ -620,6 +630,11 @@ async function showEval(){
   $('taggingLink').style.display='';
   setUrlParam('view','eval');
   setUrlParam('clip',null);
+  // Through api() so a token-gated server still accepts them; the marks file is exactly
+  // what eval/run_eval.py takes as --marks.
+  $('evDlMarks').href=api('/api/export');
+  const res=api('/api/eval');
+  $('evDlResults').href=res+(res.includes('?')?'&':'?')+'download=1';
   let r;
   try{ r=await fetch(api('/api/eval')); }catch(e){ $('evSummary').textContent='Could not reach the server.'; return; }
   if(!r.ok){ $('evSummary').textContent='Could not load the evaluation ('+r.status+').'; return; }

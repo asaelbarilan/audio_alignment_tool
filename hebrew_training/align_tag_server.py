@@ -1567,10 +1567,18 @@ def make_handler(args, dataset: Dataset, clips):
                     with EVAL_LOCK:
                         EVAL_CACHE.update(key=fingerprint, result=cached)
                 result = cached
+                from urllib.parse import parse_qs
+
+                wants_file = "download" in parse_qs(urlparse(self.path).query)
                 return self.send(
                     200,
-                    json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                    json.dumps(result, ensure_ascii=False, indent=2 if wants_file else None).encode(
+                        "utf-8"
+                    ),
                     "application/json; charset=utf-8",
+                    {"Content-Disposition": 'attachment; filename="aligner_eval.json"'}
+                    if wants_file
+                    else None,
                 )
             if route == "/api/export":
                 # The marks live in Postgres once hosted, but the rest of the pipeline reads
