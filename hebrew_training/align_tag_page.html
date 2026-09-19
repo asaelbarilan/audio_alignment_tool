@@ -591,6 +591,8 @@ const ALIGNER_DESC={
   hebrew:'wav2vec2 Hebrew CTC (imvladikon)',
   mms:'Meta MMS forced aligner',
   stable_ts:"ivrit.ai's shipped timings (Whisper + stable-ts)",
+  'ivrit-ai':'timings shipped with the ivrit.ai dataset',
+  mwa:'Multilingual Word Aligner (arXiv 2606.10675) &mdash; the align button',
 };
 const fmtMs=v=>(v==null?'&ndash;':Math.round(v)+' ms');
 const errClass=v=>v==null?'':(v<=50?'evGood':(v<=100?'evMid':'evBad'));
@@ -615,7 +617,7 @@ function renderEval(d){
   const people=Object.entries(d.annotators||{}).map(([n,c])=>n+' '+c).join(', ');
   $('evSummary').innerHTML=d.marked_clips
     ? '<b>'+d.marked_clips+'</b> clips marked by '+people
-      +(d.excluded&&d.excluded.length?' &middot; excluded: '+d.excluded.join(', '):'')
+      +(d.left_out&&d.left_out.length?' &middot; left out (test accounts): '+d.left_out.join(', '):'')
     : 'No marked clips yet.';
   const ranked=Object.entries(d.aligners||{}).filter(([,s])=>s.boundaries)
     .sort((a,b)=>a[1].p90_ms-b[1].p90_ms);
@@ -694,7 +696,8 @@ function renderSignificance(d){
     w.innerHTML='<b>Not a fair test for '+seed+'.</b> The tool opens every clip on '+seed
       +'\'s boundaries, and '+ss.unmoved_pct+'% of the human boundaries were never moved. '
       +'Each of those counts as '+seed+' being exactly right, whether anyone checked it or '
-      +'not, so its scores are flattered. Only comparisons between the other aligners are fair.';
+      +'not, so its scores are flattered. A comparison it <i>wins</i> may owe the win to that; '
+      +'one it <i>loses</i> was lost despite it, and still holds.';
   } else w.hidden=true;
 
   const tests=d.comparisons||[];
@@ -715,7 +718,9 @@ function renderSignificance(d){
       :(t.seed_lost_anyway?'<span class="evRobust">holds despite '+seed+'\'s head start</span>':'');
     s+='<tr><td>'+t.a+' vs '+t.b+unfair+'</td><td>'+(label[t.metric]||t.metric)+'</td>'
       +'<td>'+(t.diff>0?'+':'')+t.diff+unit+'</td><td>'+t.ci[0]+' to '+t.ci[1]+'</td>'
-      +'<td>'+t.p_holm+'</td><td>'+verdict+'</td></tr>';
+      // No redrawn sample crossed zero: that bounds p below the resolution of the draws,
+      // it does not make it zero.
+      +'<td>'+(t.p_holm===0?'&lt; 0.001':t.p_holm)+'</td><td>'+verdict+'</td></tr>';
   });
   $('evSig').innerHTML=s;
 }
