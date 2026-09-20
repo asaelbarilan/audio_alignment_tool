@@ -656,6 +656,14 @@ async function showEval(){
 }
 
 function renderEval(d){
+  // A status payload is not a result. An older cached page rendered one as if it were and
+  // announced "no marked clips" while the server was still computing them.
+  if(d && d.status){
+    $('evSummary').textContent = d.status==='error'
+      ? 'The evaluation failed: '+d.error
+      : 'Still scoring on the server — reload in a moment.';
+    return;
+  }
   const people=Object.entries(d.annotators||{}).map(([n,c])=>n+' '+c).join(', ');
   $('evSummary').innerHTML=d.marked_clips
     ? '<b>'+d.marked_clips+'</b> clips marked by '+people

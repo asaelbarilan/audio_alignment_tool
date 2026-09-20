@@ -1471,7 +1471,16 @@ def make_handler(args, dataset: Dataset, clips):
             # is exposed by this -- the HTML carries no clips and no marks, and every /api
             # route below still demands the token.
             if route == "/":
-                return self.send(200, page(), "text/html; charset=utf-8")
+                # Never let a browser keep an old copy. The page and the API are deployed
+                # together, so a cached page talking to a new API misreads it -- a stale
+                # page took the new "computing" reply for a result and reported "no marked
+                # clips" while 76 sat in the database.
+                return self.send(
+                    200,
+                    page(),
+                    "text/html; charset=utf-8",
+                    {"Cache-Control": "no-store, must-revalidate"},
+                )
             if not self.authorised():
                 return self.send(403, b"bad or missing token", "text/plain")
             if route == "/api/me":
