@@ -220,6 +220,9 @@
   #readOnlyTitle{font-weight:600;color:#6aa0ff;font-size:13px}
   .roMarksSelect{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#8a8f98}
   .roMarksSelect select{padding:4px 8px;font-size:12px}
+  /* Errors used to be invisible unless the console was open. */
+  #pageErr{display:none;background:#40161b;border-bottom:1px solid #a33;color:#ffc9c9;
+    padding:10px 16px;font-size:13px;cursor:pointer;position:sticky;top:0;z-index:50}
  </style>
 
 <div id="gate"><div class="card">
@@ -593,6 +596,51 @@ let snapThreshRatio=parseFloat(localStorage.getItem('tagSnapThresh')||'0.42');
 let snapMinSepMs=parseInt(localStorage.getItem('tagSnapMinSep')||'20',10);
 let snapShow=localStorage.getItem('tagSnapShow')==='1';
 const $=id=>document.getElementById(id);
+
+// Nothing in this page used to say when it broke. boot() is fired and forgotten, so a
+// single failed fetch left a half-drawn screen and no message -- indistinguishable, from
+// the outside, from a page that is merely slow. Every error now names itself on screen.
+function fail(msg){
+  let b=$('pageErr');
+  if(!b){
+    b=document.createElement('div');
+    b.id='pageErr';
+    b.onclick=()=>{b.style.display='none';};
+    document.body.insertBefore(b,document.body.firstChild);
+  }
+  b.textContent=msg+'  — click to dismiss';
+  b.style.display='block';
+  console.error(msg);
+}
+// The server stamps the build of the file it just served here. A browser running an older
+// copy out of its cache is the one failure this page cannot detect by looking at itself --
+// it worked, against a server that had moved on. So it asks, once, and reloads past the
+// cache if the answer differs. The sessionStorage guard is what stops a proxy that keeps
+// serving the old copy from turning this into a reload loop.
+const BUILD='__BUILD__';
+async function checkBuild(){
+  try{
+    const d=await (await fetch('/api/progress',{cache:'no-store'})).json();
+    if(!d.build || d.build===BUILD) return false;
+    const seen='reloaded-for-'+d.build;
+    if(sessionStorage.getItem(seen)){
+      fail('This page is an old copy (build '+BUILD+', the server has '+d.build
+        +') and reloading did not replace it. Press Ctrl+Shift+R.');
+      return false;
+    }
+    sessionStorage.setItem(seen,'1');
+    const u=new URL(location.href);
+    u.searchParams.set('b',d.build);
+    location.replace(u.toString());
+    return true;
+  }catch(e){ return false; }
+}
+addEventListener('error',e=>fail('The page hit an error: '+(e.message||e.error)));
+addEventListener('unhandledrejection',e=>{
+  const r=e.reason;
+  fail('The page hit an error: '+((r&&r.message)||r));
+});
+
 const f3=t=>t.toFixed(3);
 const mmss=t=>{t=Math.max(0,t);return Math.floor(t/60)+':'+(t%60).toFixed(2).padStart(5,'0');};
 
@@ -1115,7 +1163,13 @@ async function backToTagging(){
 }
 
 async function boot(){
-  ME=await (await fetch(api('/api/me'))).json();
+  if(await checkBuild()) return;   // an old copy; the reload is already on its way
+  let r;
+  try{ r=await fetch(api('/api/me')); }
+  catch(e){ return fail('Could not reach the server: '+e.message); }
+  if(!r.ok) return fail('The server refused the page ('+r.status+'). Try signing in again.');
+  try{ ME=await r.json(); }
+  catch(e){ return fail('The server sent something unreadable instead of your account.'); }
   if(ME.migrate) return showMigrate();
   if(ME.auth){
     if(!ME.logged_in) return signIn();
@@ -1200,9 +1254,20 @@ async function load(){
     const meta=await (await fetch(api('/api/meta'))).json();
     if(meta && meta.aligner===false) $('alignBtn').title='Aligner disabled';
   }catch(e){}
-  clips=await (await fetch(api('/api/clips'))).json();
   const v=PARAMS.get('view');
   const cl=PARAMS.get('clip');
+  // The evaluation and the overview do not need the annotator's clip list, and a clip
+  // opened by id fetches its own. Letting this one call decide whether the page appears at
+  // all is what turned a slow dataset listing into a blank screen.
+  try{
+    const r=await fetch(api('/api/clips'));
+    if(!r.ok) throw new Error('/api/clips answered '+r.status);
+    clips=await r.json();
+  }catch(e){
+    clips=[];
+    if(v!=='overview' && v!=='eval' && !cl){ fail('The clip list did not load: '+e.message); return; }
+    fail('The clip list did not load ('+e.message+'); the rest of this page is unaffected.');
+  }
   if(v==='overview'){
     PARAMS.delete('view');
     return showOverview();
@@ -3288,5 +3353,5 @@ addEventListener('popstate',()=>{
   else if(c) openClip(c);
   else backToTagging();
 });
-boot();
+boot().catch(e=>fail('The page could not start: '+(e&&e.message||e)));
 </script>

@@ -649,9 +649,20 @@ def run_align_job(
 PAGE_FILE = Path(__file__).with_name("align_tag_page.html")
 
 
+def page_build() -> str:
+    """A short id for the exact UI this server would serve right now."""
+    return hashlib.sha256(PAGE_FILE.read_bytes()).hexdigest()[:8]
+
+
 def page() -> bytes:
-    """Read the UI from disk on every request, so editing the page needs no restart."""
-    return PAGE_FILE.read_bytes()
+    """Read the UI from disk on every request, so editing the page needs no restart.
+
+    The build is stamped in, and /api/progress reports the same value, so a browser holding
+    an older copy can notice and reload past its cache instead of silently misbehaving
+    against a server that has moved on -- which is exactly how the empty dashboard looked.
+    """
+    raw = PAGE_FILE.read_bytes()
+    return raw.replace(b"__BUILD__", page_build().encode("ascii"), 1)
 
 
 _NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
@@ -1671,6 +1682,9 @@ def make_handler(args, dataset: Dataset, clips):
                         )
                 body = {
                     "clips": len(clips),
+                    # The page compares this with its own stamp and reloads past its cache
+                    # if it is running an older copy.
+                    "build": page_build(),
                     "annotators": rows,
                     "marked_total": sum(r["marked"] for r in rows),
                     # What the scorer is actually working with. Without this, a dashboard
