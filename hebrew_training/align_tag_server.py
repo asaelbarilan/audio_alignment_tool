@@ -1425,6 +1425,69 @@ EVAL_CACHE: dict = {}
 EVAL_LOCK = threading.Lock()
 
 
+def eval_inputs(args) -> tuple[list[dict], set[str]]:
+    """Everything the scorer is given: the marks, and the accounts to leave out of them."""
+    gold: list[dict] = []
+    if STORE is not None:
+        for name, payload in STORE.everything():
+            gold += [{**row, "annotator": name} for row in payload]
+    else:
+        for f in sorted(args.out.glob("*.jsonl")):
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    gold.append({**json.loads(line), "annotator": f.stem})
+    exclude = {
+        n.strip()
+        for n in os.environ.get("EVAL_EXCLUDE", "probe").split(",")
+        if n.strip()
+    }
+    return gold, exclude
+
+
+def eval_now(args, clips) -> tuple[dict | None, str | None, int]:
+    """The scored result if it is ready, starting the worker if it is not.
+
+    The bootstrap is the better part of a minute on a small host, so it never runs inside a
+    request -- the page is answered at once and polls. main() calls this at boot as well, so
+    the first person to open the dashboard after a deploy usually finds it already done
+    rather than watching a counter. Returns (result, error, marked clips).
+    """
+    from hebrew_training.aligner_eval import evaluate
+
+    gold, exclude = eval_inputs(args)
+    known = {c["id"] for c in clips}
+    marked = len({g.get("id") for g in gold if g.get("id") in known})
+    # The answer only changes when someone saves a mark, so it is computed once per distinct
+    # set of marks and kept until they change.
+    fingerprint = hashlib.sha256(
+        json.dumps([gold, sorted(exclude)], sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+    def compute():
+        try:
+            out = evaluate(clips, gold, exclude=exclude)
+            out["excluded"] = sorted(exclude)
+            with EVAL_LOCK:
+                EVAL_CACHE.update(key=fingerprint, result=out, error=None)
+        except Exception as exc:  # noqa: BLE001 -- report it, do not lose it
+            with EVAL_LOCK:
+                EVAL_CACHE.update(
+                    key=fingerprint, result=None, error=f"{type(exc).__name__}: {exc}"
+                )
+        finally:
+            with EVAL_LOCK:
+                EVAL_CACHE["running"] = None
+
+    with EVAL_LOCK:
+        hit = EVAL_CACHE.get("key") == fingerprint
+        cached = EVAL_CACHE.get("result") if hit else None
+        failed = EVAL_CACHE.get("error") if hit else None
+        if cached is None and failed is None and EVAL_CACHE.get("running") != fingerprint:
+            EVAL_CACHE["running"] = fingerprint
+            threading.Thread(target=compute, daemon=True).start()
+    return cached, failed, marked
+
+
 def make_handler(args, dataset: Dataset, clips):
     by_key = {clip_key(c): c for c in clips}
     for c in clips:
@@ -1557,58 +1620,13 @@ def make_handler(args, dataset: Dataset, clips):
             if route == "/api/eval":
                 # The same rows /api/export hands out, scored by the same module the local
                 # script uses -- so the dashboard and a downloaded file cannot disagree.
-                from hebrew_training.aligner_eval import evaluate
-
-                gold = []
-                if STORE is not None:
-                    for name, payload in STORE.everything():
-                        gold += [{**row, "annotator": name} for row in payload]
-                else:
-                    for f in sorted(args.out.glob("*.jsonl")):
-                        for line in f.read_text(encoding="utf-8").splitlines():
-                            if line.strip():
-                                gold.append({**json.loads(line), "annotator": f.stem})
-                exclude = {
-                    n.strip()
-                    for n in os.environ.get("EVAL_EXCLUDE", "probe").split(",")
-                    if n.strip()
-                }
-                # The bootstrap takes tens of seconds and the answer only changes when
-                # someone saves a mark, so it is computed once per distinct set of marks --
-                # and in a worker, never in the request. Holding the connection open for it
-                # leaves the page on "Loading..." for as long as the platform's gateway
-                # allows, then kills it with no error to show.
-                fingerprint = hashlib.sha256(
-                    json.dumps([gold, sorted(exclude)], sort_keys=True, ensure_ascii=False)
-                    .encode("utf-8")
-                ).hexdigest()
-
-                def compute():
-                    try:
-                        out = evaluate(clips, gold, exclude=exclude)
-                        out["excluded"] = sorted(exclude)
-                        with EVAL_LOCK:
-                            EVAL_CACHE.update(key=fingerprint, result=out, error=None)
-                    except Exception as exc:  # noqa: BLE001 -- report it, do not lose it
-                        with EVAL_LOCK:
-                            EVAL_CACHE.update(key=fingerprint, result=None,
-                                              error=f"{type(exc).__name__}: {exc}")
-                    finally:
-                        with EVAL_LOCK:
-                            EVAL_CACHE["running"] = None
-
-                with EVAL_LOCK:
-                    hit = EVAL_CACHE.get("key") == fingerprint
-                    cached = EVAL_CACHE.get("result") if hit else None
-                    failed = EVAL_CACHE.get("error") if hit else None
-                    busy = EVAL_CACHE.get("running") == fingerprint
-                    if cached is None and failed is None and not busy:
-                        EVAL_CACHE["running"] = fingerprint
-                        busy = True
-                        threading.Thread(target=compute, daemon=True).start()
+                # Never in the request: holding the connection open for the bootstrap leaves
+                # the page on "Loading..." until the platform's gateway kills it, with no
+                # error to show.
+                cached, failed, marked = eval_now(args, clips)
                 if cached is None:
                     body = ({"status": "error", "error": failed} if failed
-                            else {"status": "computing", "clips": len(clips)})
+                            else {"status": "computing", "clips": marked})
                     return self.send(
                         200,
                         json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -2193,6 +2211,15 @@ def main() -> None:
     )
     words = sum(len(c["a"]) for c in clips)
     print(f"{len(clips)} clips, {words} boundaries to check")
+    # Score straight away, in the background. The result is held in memory, so every deploy
+    # and every restart throws it away, and without this the first person to open the
+    # dashboard is the one who waits out the bootstrap.
+    try:
+        _, _, marked = eval_now(args, clips)
+        if marked:
+            print(f"scoring {marked} marked clips in the background for the dashboard")
+    except Exception as exc:  # noqa: BLE001 -- a warm cache is a nicety, not a reason to fail
+        print(f"could not start the evaluation: {type(exc).__name__}: {exc}")
     where = "localhost" if args.host in ("127.0.0.1", "localhost") else args.host
     link = f"http://{where}:{args.port}/"
     if args.token:
