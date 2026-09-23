@@ -667,6 +667,15 @@ def page() -> bytes:
 
 _NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
+
+def admins() -> set[str]:
+    """The Google addresses allowed to let new annotators in, from TAG_ADMINS.
+
+    Kept in the environment rather than the code: it is a list of real people's addresses,
+    and the repository is public.
+    """
+    return {e.strip().lower() for e in os.environ.get("TAG_ADMINS", "").split(",") if e.strip()}
+
 AUTH_ISSUER = "https://auth.xhostd.com"
 JWKS_URL = "https://auth.xhostd.com/xhost-auth/jwks"
 COOKIE = "__Host-xhost_id"
@@ -764,8 +773,59 @@ class PostgresStore:
                 "  email   TEXT,"
                 "  display TEXT)"
             )
+            self._ensure_identity_approval(conn)
             self._ensure_claims_table(conn)
             self._ensure_marks_table(conn)
+
+    def _ensure_identity_approval(self, conn) -> None:
+        """Add the approval columns, and let the people already annotating carry on.
+
+        Turning a gate on must not lock out the annotators whose marks are already in the
+        table. The grandfathering therefore runs exactly once, at the moment the column is
+        created, and never again -- so a later restart cannot silently approve somebody who
+        is genuinely waiting.
+        """
+        already = conn.execute(
+            "SELECT 1 FROM information_schema.columns"
+            " WHERE table_name = 'identities' AND column_name = 'approved_at'"
+        ).fetchone()
+        if already:
+            return
+        conn.execute("ALTER TABLE identities ADD COLUMN approved_at TIMESTAMPTZ")
+        conn.execute("ALTER TABLE identities ADD COLUMN approved_by TEXT")
+        conn.execute("ALTER TABLE identities ADD COLUMN first_seen TIMESTAMPTZ DEFAULT now()")
+        conn.execute(
+            "UPDATE identities SET approved_at = now(), approved_by = 'already annotating'"
+        )
+
+    def is_approved(self, sub: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT approved_at FROM identities WHERE sub = %s", (sub,)
+            ).fetchone()
+        return bool(row and row[0])
+
+    def waiting(self) -> list[dict]:
+        """Everyone who has picked a name but has not been let in yet."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT sub, name, email, display, first_seen FROM identities"
+                " WHERE approved_at IS NULL ORDER BY first_seen"
+            ).fetchall()
+        return [
+            {"sub": r[0], "name": r[1], "email": r[2], "display": r[3],
+             "since": r[4].isoformat() if r[4] else None}
+            for r in rows
+        ]
+
+    def approve(self, sub: str, by: str) -> bool:
+        with self.connect() as conn:
+            done = conn.execute(
+                "UPDATE identities SET approved_at = now(), approved_by = %s"
+                " WHERE sub = %s AND approved_at IS NULL",
+                (by, sub),
+            )
+            return bool(getattr(done, "rowcount", 0))
 
     def _ensure_claims_table(self, conn) -> None:
         if conn.execute("SELECT to_regclass('claims')").fetchone()[0] is None:
@@ -968,6 +1028,8 @@ class PostgresStore:
             if held and held[0] != sub:
                 return None
             conn.execute(
+                # approved_at is deliberately absent from the UPDATE: signing in again
+                # must neither grant approval nor take it away.
                 "INSERT INTO identities (sub, name, email, display) VALUES (%s,%s,%s,%s)"
                 " ON CONFLICT (sub) DO UPDATE SET name = EXCLUDED.name,"
                 "   email = EXCLUDED.email, display = EXCLUDED.display",
@@ -1529,6 +1591,29 @@ def make_handler(args, dataset: Dataset, clips):
             name = (parse_qs(urlparse(self.path).query).get("who") or [""])[0]
             return name if _NAME.match(name) else None
 
+        def standing(self):
+            """(may this person save, may they approve others).
+
+            Without --auth there is nobody to gate, so everything is allowed; that is the
+            local single-user case and adding a gate to it would only be in the way.
+            """
+            if not args.auth or STORE is None:
+                return True, False
+            # No approver configured means no one could ever let anybody in, so the gate
+            # stays open rather than stranding the next person who signs in. Setting
+            # TAG_ADMINS is what turns it on; leaving it unset keeps today's behaviour.
+            if not admins():
+                return True, False
+            person = self.signed_in()
+            if not person:
+                return False, False
+            email = (person.get("email") or "").lower()
+            # An approver is approved by definition. Without this, the first person named in
+            # TAG_ADMINS would sign in, land in the queue, and have nobody able to let them
+            # out of it.
+            admin = email in admins()
+            return (admin or STORE.is_approved(person["sub"])), admin
+
         def authorised(self):
             from urllib.parse import parse_qs
 
@@ -1567,11 +1652,15 @@ def make_handler(args, dataset: Dataset, clips):
                     "logout_url": "/xhost-auth/logout?return_to=/",
                 }
                 if person:
+                    approved, admin = self.standing()
                     body.update(
                         {
                             "display": person["display"],
                             "email": person["email"],
                             "name": STORE.binding(person["sub"]) if STORE else None,
+                            "approved": approved,
+                            "admin": admin,
+                            "waiting": len(STORE.waiting()) if (admin and STORE) else 0,
                         }
                     )
                 return self.send(
@@ -1731,6 +1820,15 @@ def make_handler(args, dataset: Dataset, clips):
                 return self.send(
                     200,
                     json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
+            if route == "/api/waiting":
+                approved, admin = self.standing()
+                if not admin:
+                    return self.send(403, b'{"error":"not an approver"}', "application/json")
+                return self.send(
+                    200,
+                    json.dumps(STORE.waiting() if STORE else [], ensure_ascii=False).encode("utf-8"),
                     "application/json; charset=utf-8",
                 )
             if route == "/api/clips":
@@ -1935,6 +2033,19 @@ def make_handler(args, dataset: Dataset, clips):
             if not self.authorised():
                 return self.send(403, b"bad or missing token", "text/plain")
             route = urlparse(self.path).path
+            # Picking a name is how somebody joins the queue, so it stays open; everything
+            # that writes a mark or takes a clip does not. Reading is untouched -- a person
+            # waiting can still open the tool and see what the work looks like.
+            WRITES = ("/api/gold", "/api/claim", "/api/unmark", "/api/align",
+                      "/api/align-cancel")
+            if route in WRITES:
+                approved, _ = self.standing()
+                if not approved:
+                    return self.send(
+                        403,
+                        b'{"error":"waiting for approval"}',
+                        "application/json",
+                    )
             if route == "/api/claim-name":
                 person = self.signed_in()
                 if not person or STORE is None:
@@ -1952,6 +2063,19 @@ def make_handler(args, dataset: Dataset, clips):
                     return self.send(409, b'{"error":"taken"}', "application/json")
                 return self.send(
                     200, json.dumps({"name": bound}).encode("utf-8"), "application/json"
+                )
+            if route == "/api/approve":
+                approved, admin = self.standing()
+                if not admin:
+                    return self.send(403, b'{"error":"not an approver"}', "application/json")
+                person = self.signed_in()
+                length = int(self.headers.get("Content-Length", 0))
+                sub = json.loads(self.rfile.read(length).decode("utf-8")).get("sub", "")
+                ok = STORE.approve(sub, person["email"]) if STORE else False
+                return self.send(
+                    200 if ok else 404,
+                    json.dumps({"ok": ok}).encode("utf-8"),
+                    "application/json",
                 )
             if route == "/api/migrate":
                 # Confirmed by any user on the page. Until this runs the whole store is
