@@ -14,7 +14,26 @@ original 35 MB of wav got out of the image.
 Marks go to Postgres (`DATABASE_URL`), one row per annotator. `GET /api/export` writes them
 back out as jsonl in the same shape as the input manifests, plus an `annotator` field.
 
-Sign-in is Google via xhostd, verified server-side from the signed cookie.
+Sign-in is Google via xhostd, verified server-side from the signed cookie. A new account
+lands in a queue: it can read everything but cannot save a mark, claim a clip or align until
+somebody lets it in, from the **approvals** screen. Who may do that is `TAG_ADMINS`, a list
+of addresses in the environment. Leave it unset and the gate is off, since a gate with no
+keyholder only strands people; the annotators already working are grandfathered in.
+
+## Scoring the aligners, and correcting one
+
+`eval/` holds everything behind the **aligner eval** screen — read `eval/README.md` first.
+
+- `eval/run_eval.py` runs every aligner over the marked clips and scores them against the
+  humans, with significance tests. Five are compared; MMS wins.
+- `eval/correct_mms.py` is the one to know about. `mms-corrected` is not a sixth aligner:
+  it is MMS's own output moved, so **MMS never has to be run again**. Two rules — a shift
+  per letter class at each boundary, then, for a word end with a pause after it, an
+  extension to where the sound actually stops. Held out: median error 29.5 → 23.4 ms, and
+  on those pre-pause ends p90 187 → 133 ms. It needs the existing timings plus the audio,
+  and no model.
+- `eval/push_corrected.py` applies it to a whole dataset, adding `mms-corrected` beside the
+  labels already there and leaving untouched any clip that has no `mms` label.
 
 The **align** button re-times a clip from scratch by calling a Multilingual-Word-Aligner
 RunPod endpoint with the clip's audio and transcript (see `api-client-guide.md`), replacing
