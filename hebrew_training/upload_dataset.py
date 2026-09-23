@@ -61,6 +61,16 @@ def parse_args() -> argparse.Namespace:
         "size at that key (default: skip those, since audio files never change "
         "content at a fixed size in practice and this dataset can be large).",
     )
+    parser.add_argument(
+        "--only",
+        nargs="+",
+        metavar="PATH",
+        help="Only consider these files, given as paths relative to the dataset "
+        "folder (e.g. --only manifest.jsonl). Everything else -- audio/* in "
+        "particular -- is never scanned or uploaded. Combine with --force to "
+        "guarantee the file is (re-)written even if an edit happened to leave "
+        "its byte size unchanged, which the default same-size skip would miss.",
+    )
     return parser.parse_args()
 
 
@@ -117,6 +127,13 @@ def main() -> None:
         )
 
     files = iter_files(dataset_dir)
+    if args.only:
+        wanted = {Path(p).as_posix() for p in args.only}
+        by_rel = {p.relative_to(dataset_dir).as_posix(): p for p in files}
+        missing = wanted - by_rel.keys()
+        if missing:
+            raise SystemExit(f"--only path(s) not found under {dataset_dir}: {sorted(missing)}")
+        files = [by_rel[rel] for rel in sorted(wanted)]
     if not files:
         raise SystemExit(f"{dataset_dir} has no files to upload")
 

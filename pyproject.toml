@@ -5,6 +5,7 @@ description = "Browser tool for hand-marking Hebrew word boundaries against forc
 requires-python = ">=3.11"
 dependencies = [
     "boto3==1.35.36",
+    "huggingface-hub>=0.25.0",
     "numpy==2.1.3",
     "psycopg[binary]==3.2.3",
     "pyjwt[crypto]==2.10.1",
