@@ -660,6 +660,7 @@ function setUrlParam(key, val){
 const ALIGNER_DESC={
   'wav2vec2-hebrew':'CTC forced alignment &mdash; imvladikon/wav2vec2-xls-r-300m-hebrew',
   mms:'CTC forced alignment &mdash; Meta MMS, 1,130 languages, romanized',
+  'mms-corrected':'MMS, then a shift per letter class and, before a pause, the end extended to where the sound stops',
   'whisper-stable-ts':'stable-ts align on faster-whisper &mdash; ivrit.ai whisper-large-v3-turbo',
   'mwa-buckeye':'Multilingual Word Aligner, buckeye checkpoint (arXiv 2606.10675) &mdash; the align button',
   'ivrit-ai':'timings shipped with the dataset (Whisper + stable-ts), not re-run here',
