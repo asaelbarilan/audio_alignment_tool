@@ -28,7 +28,8 @@ keyholder only strands people; the annotators already working are grandfathered 
   humans, with significance tests. Five are compared; MMS wins.
 - `eval/correct_mms.py` is the one to know about. `mms-corrected` is not a sixth aligner:
   it is MMS's own output moved, so **MMS never has to be run again**. Two rules — a shift
-  per letter class at each boundary, then, for a word end with a pause after it, an
+  set by the letter at each boundary (the first letter moves the start, the last letter the
+  end), then, for a word end with a pause after it, an
   extension to where the sound actually stops. Held out: median error 29.5 → 23.4 ms, and
   on those pre-pause ends p90 187 → 133 ms. It needs the existing timings plus the audio,
   and no model.
