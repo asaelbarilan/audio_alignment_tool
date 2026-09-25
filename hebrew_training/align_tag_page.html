@@ -1301,6 +1301,9 @@ function signIn(){
   $('gatetext').textContent='Sign in so your marks are yours: nobody else can save under '
     +'your name, and you keep the same work across devices.';
   const b=$('gsignin'); b.hidden=false;
+  // --local-auth stands in for the whole gate, including this label -- a real "Sign in
+  // with Google" button that does not talk to Google would be the confusing part.
+  b.textContent=(ME&&ME.local_auth)?'Sign in (local)':'Sign in with Google';
   b.onclick=()=>{ location.href=ME.login_url; };
 }
 

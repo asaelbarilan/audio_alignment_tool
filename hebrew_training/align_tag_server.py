@@ -115,8 +115,24 @@ def parse_args() -> argparse.Namespace:
         "from the cookie and ?who= is ignored, which is what stops an annotator writing as "
         "someone else. Needs a database for the name bindings.",
     )
+    parser.add_argument(
+        "--local-auth",
+        action="store_true",
+        help="Stand in for --auth when xhostd's proxy is not reachable, e.g. running "
+        "locally. Signing in is a form on this server asking only for an email, not "
+        "Google -- there is no real identity check, so the whole approval queue and "
+        "TAG_ADMINS gate can be exercised without xhostd. Needs DATABASE_URL, same as "
+        "--auth. Never point this at a host anyone else can reach: whatever email a "
+        "browser types in is who the server believes signed in.",
+    )
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8080)))
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.local_auth:
+        if args.auth:
+            parser.error("--auth and --local-auth are two ways to identify people; pick one")
+        args.auth = "local"  # not one of --auth's own choices; everything below just
+        # tests args.auth for truthiness and only identity() branches on which kind
+    return args
 
 
 def clean(text: str) -> str:
@@ -666,6 +682,7 @@ def page() -> bytes:
 
 
 _NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def admins() -> set[str]:
@@ -739,6 +756,64 @@ def identity(cookie_header: str, host: str) -> dict | None:
         "email": claims.get("email", ""),
         "display": claims.get("name") or claims.get("email", ""),
     }
+
+
+# ---- --local-auth ------------------------------------------------------------
+#
+# Stands in for the block above when xhostd's proxy is not reachable, i.e. running this
+# server on a laptop. There is no identity provider to verify against, so the trade is
+# explicit: whatever email a browser types into the form at /local-auth/login is who the
+# server believes signed in. Everything downstream of signed_in() -- who(), standing(),
+# the approval queue, the admin check -- takes a plain {sub, email, display} dict either
+# way and does not know or care which path produced it.
+
+LOCAL_COOKIE = "tag_local_id"
+_LOCAL_SESSIONS: dict[str, dict] = {}  # cookie value -> {"sub", "email", "display"}
+
+
+def local_sub(email: str) -> str:
+    """A stable id per email, the same way a Google account's sub is stable per account --
+    signing in twice with the same address returns to the same queued/approved identity,
+    which is what lets the approval flow be tested more than once with the same person."""
+    return "local:" + email
+
+
+def local_identity(cookie_header: str) -> dict | None:
+    """The --local-auth session, or None. No signature, no issuer, no expiry -- just a
+    random id this process handed out, looked up in memory."""
+    token = ""
+    for part in (cookie_header or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name == LOCAL_COOKIE:
+            token = value
+            break
+    return _LOCAL_SESSIONS.get(token)
+
+
+_LOCAL_LOGIN_HTML = b"""<!doctype html>
+<meta charset="utf-8">
+<title>local sign-in</title>
+<style>
+  body{font:15px/1.5 system-ui,sans-serif;max-width:420px;margin:80px auto;padding:0 16px}
+  input{font:inherit;padding:6px 8px;width:100%;box-sizing:border-box;margin:8px 0}
+  button{font:inherit;padding:6px 14px}
+  .err{color:#b00}
+</style>
+<h2>Local sign-in</h2>
+<p>Stands in for Google sign-in -- the server was started with <code>--local-auth</code>.
+Whatever email you type here is who it believes signed in; there is no real identity
+check behind it.</p>
+__ERROR__
+<form method="post" action="/local-auth/login">
+  <label>email<input name="email" type="email" required autofocus></label>
+  <button type="submit">sign in</button>
+</form>
+"""
+
+
+def local_login_page(error: bool = False) -> bytes:
+    msg = b'<p class="err">Type a real-looking email address.</p>' if error else b""
+    return _LOCAL_LOGIN_HTML.replace(b"__ERROR__", msg)
 
 
 class PostgresStore:
@@ -1569,7 +1644,10 @@ def make_handler(args, dataset: Dataset, clips):
             self.wfile.write(body)
 
         def signed_in(self):
-            """The verified Google account, when auth is on."""
+            """The signed-in account, when auth is on -- a verified Google account under
+            --auth, or a self-declared local one under --local-auth."""
+            if args.auth == "local":
+                return local_identity(self.headers.get("Cookie", ""))
             if not args.auth:
                 return None
             host = self.headers.get("Host", "").split(":")[0]
@@ -1640,16 +1718,43 @@ def make_handler(args, dataset: Dataset, clips):
                     "text/html; charset=utf-8",
                     {"Cache-Control": "no-store, must-revalidate"},
                 )
+            # Stands in for the redirect to xhostd's hosted login page, so it is reachable
+            # the same way -- before the token gate, since a signed-out browser has no
+            # token yet either.
+            if route == "/local-auth/login" and args.auth == "local":
+                return self.send(200, local_login_page(), "text/html; charset=utf-8")
+            if route == "/local-auth/logout" and args.auth == "local":
+                token = ""
+                for part in self.headers.get("Cookie", "").split(";"):
+                    name, _, value = part.strip().partition("=")
+                    if name == LOCAL_COOKIE:
+                        token = value
+                _LOCAL_SESSIONS.pop(token, None)
+                return self.send(
+                    302,
+                    b"",
+                    "text/plain",
+                    {
+                        "Location": "/",
+                        "Set-Cookie": f"{LOCAL_COOKIE}=; Path=/; Max-Age=0",
+                    },
+                )
             if not self.authorised():
                 return self.send(403, b"bad or missing token", "text/plain")
             if route == "/api/me":
                 person = self.signed_in()
+                local = args.auth == "local"
                 body = {
                     "auth": bool(args.auth),
+                    "local_auth": local,
                     "logged_in": bool(person),
                     "migrate": bool(STORE is not None and STORE.pending_migration),
-                    "login_url": "/xhost-auth/login?return_to=/",
-                    "logout_url": "/xhost-auth/logout?return_to=/",
+                    "login_url": (
+                        "/local-auth/login" if local else "/xhost-auth/login?return_to=/"
+                    ),
+                    "logout_url": (
+                        "/local-auth/logout" if local else "/xhost-auth/logout?return_to=/"
+                    ),
                 }
                 if person:
                     approved, admin = self.standing()
@@ -2030,9 +2135,35 @@ def make_handler(args, dataset: Dataset, clips):
             return self.send(404, b"not found", "text/plain")
 
         def do_POST(self):
+            route = urlparse(self.path).path
+            # Ahead of the token check for the same reason as its GET counterpart: this is
+            # the sign-in form itself, posted from a browser that has no token yet.
+            if route == "/local-auth/login" and args.auth == "local":
+                length = int(self.headers.get("Content-Length", 0))
+                form = self.rfile.read(length).decode("utf-8", "replace")
+                from urllib.parse import parse_qs
+
+                email = (parse_qs(form).get("email") or [""])[0].strip().lower()
+                if not _EMAIL.match(email):
+                    return self.send(
+                        400, local_login_page(error=True), "text/html; charset=utf-8"
+                    )
+                sub = local_sub(email)
+                token = uuid.uuid4().hex
+                _LOCAL_SESSIONS[token] = {"sub": sub, "email": email, "display": email}
+                return self.send(
+                    302,
+                    b"",
+                    "text/plain",
+                    {
+                        "Location": "/",
+                        # Not __Host- like the real cookie: this server may be plain http
+                        # locally, and __Host- requires Secure.
+                        "Set-Cookie": f"{LOCAL_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax",
+                    },
+                )
             if not self.authorised():
                 return self.send(403, b"bad or missing token", "text/plain")
-            route = urlparse(self.path).path
             # Picking a name is how somebody joins the queue, so it stays open; everything
             # that writes a mark or takes a clip does not. Reading is untouched -- a person
             # waiting can still open the tool and see what the work looks like.
@@ -2300,9 +2431,11 @@ def main() -> None:
         print(f"marks -> Postgres (DATABASE_URL), dataset {args.dataset!r}")
     if args.auth and STORE is None:
         raise SystemExit(
-            "--auth needs DATABASE_URL: the name bindings live in the database"
+            "--auth/--local-auth needs DATABASE_URL: the name bindings live in the database"
         )
-    if args.auth:
+    if args.auth == "local":
+        print("local sign-in required (--local-auth); ?who= ignored -- do not expose this")
+    elif args.auth:
         print("google sign-in required; ?who= ignored")
     CLAIMS = STORE if STORE is not None else FileClaims(args.out)
     print(f"split is always on: each annotator gets their own clips, {BLOCK} at a time")
