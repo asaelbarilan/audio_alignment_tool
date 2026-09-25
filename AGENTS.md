@@ -10,7 +10,7 @@ for a 4,000-hour Hebrew TTS corpus (Knesset plenum, committee and recital audio)
 
 Two repositories, side by side, both on GitHub:
 
-- `C:\Users\Asael\PycharmProjects\audio_alginment_tool` — this one: the tool, the evaluation,
+- `C:\Users\Asael\PycharmProjects\audio_alignment_tool` — this one: the tool, the evaluation,
   the correction. Source of truth for what is deployed.
 - `C:\Users\Asael\PycharmProjects\pocket-tts` — the write-ups. Every finding below is argued
   out properly in `pocket-tts/docs/`, with the papers in `pocket-tts/papers/hebrew-alignment/`.
