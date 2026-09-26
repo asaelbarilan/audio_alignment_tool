@@ -22,6 +22,13 @@ async function openClip(key, forceReadOnly, extraLanes){
     return;
   }
   const data=await r.json();
+  // Opened from the eval screen: what is on screen has to be what was scored, not
+  // whatever the live dataset happens to hold right now -- those can have drifted apart
+  // since the result was computed. This also means nobody's marks and no claim state
+  // decide anything here; it is a read of a frozen result, never a tagging session.
+  const evalMode=Boolean(extraLanes&&extraLanes.length);
+  const evalClip=evalMode&&S.evalData&&S.evalData.clip_data&&S.evalData.clip_data[data.id];
+  const evalHuman=(evalClip&&evalClip.human)||null;
   if(extraLanes&&extraLanes.length){
     // An eval result's alignment replaces the dataset's label of the same name: it is the
     // one the numbers on the eval screen were computed from.
@@ -31,7 +38,7 @@ async function openClip(key, forceReadOnly, extraLanes){
   S.currentClipDetail=data;
 
   const isMine=Boolean(data.claim&&data.claim.claimed_by_me);
-  S.isReadOnly=(forceReadOnly || !isMine);
+  S.isReadOnly=evalMode||(forceReadOnly || !isMine);
 
   $('overviewScreen').classList.remove('on');
   $('evalScreen').classList.remove('on');
@@ -44,64 +51,92 @@ async function openClip(key, forceReadOnly, extraLanes){
 
   if(S.isReadOnly){
     $('readOnlyBanner').style.display='flex';
-    let claimText='Unclaimed';
-    if(data.claim&&data.claim.claimant){
-      claimText='Claimed by '+(data.claim.claimed_by_me?'you':data.claim.claimant)
-        +(data.claim.done?' (done)':'');
-    }
-    $('readOnlyClaimInfo').textContent=claimText;
-
     const select=$('roMarksSelect');
     select.innerHTML='';
-    const baseOpt=document.createElement('option');
-    baseOpt.value='__baseline__';
-    baseOpt.textContent='Baseline (aligner)';
-    select.appendChild(baseOpt);
 
-    const markKeys=Object.keys(data.marks||{});
-    markKeys.forEach(ann=>{
-      const opt=document.createElement('option');
-      opt.value=ann;
-      opt.textContent=ann+(ann===S.WHO?' (your marks)':'');
-      select.appendChild(opt);
-    });
-
-    let defaultChoice='__baseline__';
-    if(data.claim&&data.claim.claimant&&data.marks&&data.marks[data.claim.claimant]){
-      defaultChoice=data.claim.claimant;
-    }else if(markKeys.length){
-      defaultChoice=markKeys[0];
-    }
-    select.value=defaultChoice;
-
-    select.onchange=()=>{
-      const choice=select.value;
-      let wordsToUse=data.words;
-      if(choice!=='__baseline__'&&data.marks&&data.marks[choice]){
-        wordsToUse=data.marks[choice];
-      }
-      S.gold=wordsToUse.map(w=>({word:w.word,start:w.start,end:w.end,was:w.was,added:w.added}));
-      S.touched=new Set();
-      buildWords();
-      draw();
-      render();
-    };
-
-    if(data.claim&&data.claim.claimable){
-      $('roClaimBtn').style.display='';
-      $('roClaimBtn').onclick=()=>claimClip(key);
-    }else{
+    if(evalMode&&evalHuman&&Object.keys(evalHuman).length){
+      $('readOnlyClaimInfo').textContent='Eval result'+(S.evalData.title?': '+S.evalData.title:'')
+        +' &middot; golden (human) marks';
+      const humanKeys=Object.keys(evalHuman).sort();
+      humanKeys.forEach(ann=>{
+        const opt=document.createElement('option');
+        opt.value=ann;
+        opt.textContent=ann+' (golden)';
+        select.appendChild(opt);
+      });
+      select.value=humanKeys[0];
+      select.onchange=()=>{
+        const wordsToUse=evalHuman[select.value]||[];
+        S.alnMain=null; S.alnMainGolden=null;  // switching the golden pick drops any aligner override
+        S.gold=wordsToUse.map(w=>({word:w.word,start:w.start,end:w.end,was:w.was,added:w.added}));
+        S.touched=new Set();
+        buildWords();
+        draw();
+        render();
+      };
+      // Claiming or saving from an eval view would write to the live dataset while
+      // looking at a frozen result -- neither belongs here, so both stay hidden rather
+      // than merely disabled.
       $('roClaimBtn').style.display='none';
+    }else{
+      let claimText='Unclaimed';
+      if(data.claim&&data.claim.claimant){
+        claimText='Claimed by '+(data.claim.claimed_by_me?'you':data.claim.claimant)
+          +(data.claim.done?' (done)':'');
+      }
+      $('readOnlyClaimInfo').textContent=claimText;
+
+      const baseOpt=document.createElement('option');
+      baseOpt.value='__baseline__';
+      baseOpt.textContent='Baseline (aligner)';
+      select.appendChild(baseOpt);
+
+      const markKeys=Object.keys(data.marks||{});
+      markKeys.forEach(ann=>{
+        const opt=document.createElement('option');
+        opt.value=ann;
+        opt.textContent=ann+(ann===S.WHO?' (your marks)':'');
+        select.appendChild(opt);
+      });
+
+      let defaultChoice='__baseline__';
+      if(data.claim&&data.claim.claimant&&data.marks&&data.marks[data.claim.claimant]){
+        defaultChoice=data.claim.claimant;
+      }else if(markKeys.length){
+        defaultChoice=markKeys[0];
+      }
+      select.value=defaultChoice;
+
+      select.onchange=()=>{
+        const choice=select.value;
+        let wordsToUse=data.words;
+        if(choice!=='__baseline__'&&data.marks&&data.marks[choice]){
+          wordsToUse=data.marks[choice];
+        }
+        S.alnMain=null; S.alnMainGolden=null;  // switching the golden pick drops any aligner override
+        S.gold=wordsToUse.map(w=>({word:w.word,start:w.start,end:w.end,was:w.was,added:w.added}));
+        S.touched=new Set();
+        buildWords();
+        draw();
+        render();
+      };
+
+      if(data.claim&&data.claim.claimable){
+        $('roClaimBtn').style.display='';
+        $('roClaimBtn').onclick=()=>claimClip(key);
+      }else{
+        $('roClaimBtn').style.display='none';
+      }
     }
 
-    if(isMine){
+    if(!evalMode&&isMine){
       $('roEditBtn').style.display='';
       $('roEditBtn').onclick=()=>openClip(key, false);
     }else{
       $('roEditBtn').style.display='none';
     }
 
-    $('roBackOvBtn').onclick=showOverview;
+    $('roBackOvBtn').onclick=evalMode?showEval:showOverview;
     setClipActionsVisible(false);
   }else{
     $('readOnlyBanner').style.display='none';
@@ -110,7 +145,9 @@ async function openClip(key, forceReadOnly, extraLanes){
 
   let existingIndex=S.clips.findIndex(x=>(x.key||x.id)===key);
   let initialSaved=null;
-  if(S.isReadOnly){
+  if(evalMode&&evalHuman&&Object.keys(evalHuman).length){
+    initialSaved=evalHuman[$('roMarksSelect').value];
+  }else if(S.isReadOnly){
     const choice=$('roMarksSelect').value;
     if(choice!=='__baseline__'&&data.marks&&data.marks[choice]){
       initialSaved=data.marks[choice];
@@ -239,6 +276,8 @@ async function loadClip(){
   if(!c) return;
   S.gold=(c.saved||c.words).map(w=>({word:w.word,start:w.start,end:w.end,was:w.was,added:w.added}));
   S.touched=new Set(c.saved?S.gold.map((_,i)=>i):[]);
+  S.alnMain=null; S.alnMainGolden=null;  // a new clip starts back on its own golden marks
+  S.alnSig=null;  // force the aligner toggles/select to rebuild even if the same names recur
   S.wi=0; S.edge='end'; S.head=0;
   S.specCanvas=null; S.snapPoints=[];
   const r=await fetch(api('/api/audio/'+encodeURIComponent(c.key||c.id||S.ci))); S.lead=parseFloat(r.headers.get('X-Lead')||'0');

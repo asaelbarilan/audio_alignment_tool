@@ -25,6 +25,9 @@ const S={
   alnShown:new Set(), alnSig:null,
   // Opened from the eval dashboard: show every aligner, since comparing them is why you came.
   alnForceAll:(new URLSearchParams(location.search).get('aligners')==='all'),
+  // Which aligner's timings currently drive playback/editing instead of the golden marks,
+  // and a snapshot of what "golden" was so declicking it has something to restore.
+  alnMain:null, alnMainGolden:null,
   stretchCache:new Map(),
 };
 try{ S.alnShown=new Set(JSON.parse(localStorage.getItem('alnShown')||'[]')); }catch(e){}

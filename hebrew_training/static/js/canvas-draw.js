@@ -1,6 +1,6 @@
 import {S,$} from './state.js';
 import {tmin,total,now,moveHead,mark,loopSpan,start} from './audio-engine.js';
-import {modified,setMark,createWordAt,editBarWord,pushWord,scheduleWordPlay,render} from './words.js';
+import {modified,setMark,createWordAt,editBarWord,pushWord,scheduleWordPlay,render,buildWords} from './words.js';
 import {freqToY} from './spectrogram.js';
 
 const MARGIN=0.35;                    // seconds of context shown either side of the word
@@ -36,10 +36,52 @@ function renderAlnToggles(){
   $('alnToggles').querySelectorAll('input').forEach(cb=>{
     cb.onchange=()=>{ cb.checked?S.alnShown.add(cb.dataset.src):S.alnShown.delete(cb.dataset.src); saveAln(); draw(); };
   });
+  renderAlnMainSelect(labels);
 }
 function setAllAln(on){
   clipLabels().forEach(l=>on?S.alnShown.add(l.source):S.alnShown.delete(l.source));
   saveAln(); S.alnSig=null; renderAlnToggles(); draw();
+}
+
+// The "playback uses" dropdown: golden marks by default, or any aligner lane, so a model's
+// own timings can actually be listened to and stepped through instead of read off the
+// picture only. Rebuilt alongside the toggles since it lists the same aligners.
+function renderAlnMainSelect(labels){
+  const sel=$('alnMainSelect');
+  if(!sel) return;
+  const opts=['<option value="">golden marks</option>']
+    .concat(labels.map(l=>'<option value="'+l.source+'">'+l.source+'</option>'));
+  sel.innerHTML=opts.join('');
+  sel.value=S.alnMain||'';
+  sel.onchange=()=>setMainAln(sel.value||null);
+}
+
+// Swap which timings actually drive the word list: playback, stepping, editing, all of it.
+// The aligner lanes are otherwise a picture only -- this is what makes the dropdown useful
+// for actually listening to where a model thinks a word starts and ends. Picking "golden
+// marks" again puts back whatever S.gold held right before the switch.
+// Read-only only: swapping S.gold mid-edit would risk a real tagging save pushing an
+// aligner's own output back out as if it were a human mark.
+function setMainAln(source){
+  if(!S.isReadOnly) return;
+  if(!source){
+    S.alnMain=null;
+    if(S.alnMainGolden){ S.gold=S.alnMainGolden.map(w=>({...w})); S.alnMainGolden=null; }
+  }else{
+    const lane=clipLabels().find(l=>l.source===source);
+    if(!lane||!lane.words||!lane.words.length) return;
+    if(!S.alnMainGolden) S.alnMainGolden=S.gold.map(w=>({...w}));
+    S.alnMain=source;
+    S.gold=lane.words.map(w=>({word:w.word,start:w.start,end:w.end}));
+  }
+  S.touched=new Set();
+  S.wi=Math.min(S.wi,S.gold.length-1);
+  if(S.wi<0) S.wi=0;
+  S.edge='end';
+  fitWord();
+  buildWords();
+  render();
+  draw();
 }
 
 // Paint the enabled lanes into the band [y0, y1) of a canvas, using its own time->x map.
@@ -567,4 +609,4 @@ zm.addEventListener('dblclick',e=>{
 })();
 
 export {ov,wave,zm,fitWord,zwin,panBy,ensureVisible,draw,drawOverview,drawWave,drawZoom,drawScroll,
-  renderAlnToggles,setAllAln,paintAlnLanes};
+  renderAlnToggles,setAllAln,paintAlnLanes,setMainAln};

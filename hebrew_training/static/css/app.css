@@ -18,6 +18,7 @@
  .alnT{display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:#c9ccd1;user-select:none}
  .alnT input{margin:0;cursor:pointer}
  .alnSw{display:inline-block;width:12px;height:4px;border-radius:2px}
+ #alnMainSelect{font-size:12px;padding:2px 6px}
  #alnBar button{font-size:11px;padding:1px 7px}
  #dl{color:#6aa0ff;font-size:13px;text-decoration:none;align-self:center}
  #dl:hover{text-decoration:underline}
