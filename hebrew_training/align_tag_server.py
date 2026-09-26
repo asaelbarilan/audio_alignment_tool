@@ -673,11 +673,24 @@ def run_align_job(
 
 
 PAGE_FILE = Path(__file__).with_name("align_tag_page.html")
+STATIC_DIR = Path(__file__).with_name("static")
+
+
+def static_files() -> list[Path]:
+    """Every file under static/, in a stable order -- so the build hash below is the same
+    hash regardless of directory-listing order, and changes only when a byte does."""
+    if not STATIC_DIR.is_dir():
+        return []
+    return sorted(p for p in STATIC_DIR.rglob("*") if p.is_file())
 
 
 def page_build() -> str:
-    """A short id for the exact UI this server would serve right now."""
-    return hashlib.sha256(PAGE_FILE.read_bytes()).hexdigest()[:8]
+    """A short id for the exact UI this server would serve right now -- the markup plus
+    every CSS/JS file under static/, so it changes when any of them do."""
+    h = hashlib.sha256(PAGE_FILE.read_bytes())
+    for f in static_files():
+        h.update(f.read_bytes())
+    return h.hexdigest()[:8]
 
 
 def page() -> bytes:
@@ -686,9 +699,18 @@ def page() -> bytes:
     The build is stamped in, and /api/progress reports the same value, so a browser holding
     an older copy can notice and reload past its cache instead of silently misbehaving
     against a server that has moved on -- which is exactly how the empty dashboard looked.
+    The same build also gets stamped onto every /static/ URL as `?v=`, so a change to any
+    JS/CSS file is a URL the browser has never cached, and the immutable cache header on
+    static/<path> below is safe.
     """
+    build = page_build()
     raw = PAGE_FILE.read_bytes()
-    return raw.replace(b"__BUILD__", page_build().encode("ascii"), 1)
+    raw = re.sub(
+        rb'(src|href)="(/static/[^"]+)"',
+        lambda m: m.group(1) + b'="' + m.group(2) + b"?v=" + build.encode("ascii") + b'"',
+        raw,
+    )
+    return raw.replace(b"__BUILD__", build.encode("ascii"), 1)
 
 
 _NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
@@ -1688,6 +1710,35 @@ def make_handler(args, dataset: Dataset, clips):
             self.end_headers()
             self.wfile.write(body)
 
+        _STATIC_TYPES = {
+            ".js": "application/javascript; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+        }
+
+        def serve_static(self, rel_path):
+            """A static/<rel_path> file, cached forever under its content-hashed URL.
+
+            page() stamps every /static/ reference with ?v=<build>, so the URL a browser
+            actually requests changes the instant the file's bytes do -- there is nothing
+            to revalidate, so this can be immutable rather than juggling ETags.
+            """
+            if not rel_path or ".." in Path(rel_path).parts:
+                return self.send(404, b"not found", "text/plain")
+            target = (STATIC_DIR / rel_path).resolve()
+            try:
+                target.relative_to(STATIC_DIR.resolve())
+            except ValueError:
+                return self.send(404, b"not found", "text/plain")
+            if not target.is_file():
+                return self.send(404, b"not found", "text/plain")
+            ctype = self._STATIC_TYPES.get(target.suffix, "application/octet-stream")
+            return self.send(
+                200,
+                target.read_bytes(),
+                ctype,
+                {"Cache-Control": "public, max-age=31536000, immutable"},
+            )
+
         def signed_in(self):
             """The signed-in account, when auth is on -- a verified Google account under
             --auth, or a self-declared local one under --local-auth."""
@@ -1763,6 +1814,10 @@ def make_handler(args, dataset: Dataset, clips):
                     "text/html; charset=utf-8",
                     {"Cache-Control": "no-store, must-revalidate"},
                 )
+            # Same posture as "/": no clips or marks live in CSS/JS, and a managed host or a
+            # signed-out browser needs the page's own assets before it has a token.
+            if route.startswith("/static/"):
+                return self.serve_static(route[len("/static/") :])
             # Stands in for the redirect to xhostd's hosted login page, so it is reachable
             # the same way -- before the token gate, since a signed-out browser has no
             # token yet either.

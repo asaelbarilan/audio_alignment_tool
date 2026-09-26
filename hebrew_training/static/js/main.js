@@ -1,0 +1,2946 @@
+
+const PARAMS=new URLSearchParams(location.search);
+const TOK=PARAMS.get('t')||'';
+let WHO=PARAMS.get('who')||localStorage.getItem('tagWho')||'';
+// Hosted, the token gates the whole server and `who` decides which file a save lands in,
+// so both have to ride along on every request.
+function api(path){
+  const [base,qs]=path.split('?');
+  const q=new URLSearchParams(qs||'');
+  if(TOK && !q.has('t')) q.set('t',TOK);
+  if(WHO && !q.has('who')) q.set('who',WHO);
+  const s=q.toString();
+  return s ? base+'?'+s : base;
+}
+let clips=[],ci=0,wi=0,edge='end',gold=[],touched=new Set();
+let sampleMode=false,sampleCsv=null,sampleWav=null,sampleBaseline=null;
+let buf=null,lead=0,ctx=null,peaks=null;
+let playing=false,head=0,loopKind=null,rate=1,seg=null;
+const MARGIN=0.35;                    // seconds of context shown either side of the word
+const ov=document.getElementById('ov'),og=ov.getContext('2d');
+const wave=document.getElementById('wave'),wg=wave.getContext('2d');
+const zm=document.getElementById('zm'),zg=zm.getContext('2d');
+let specCanvas=null,specData=null,snapPoints=[];
+let snapThreshRatio=parseFloat(localStorage.getItem('tagSnapThresh')||'0.42');
+let snapMinSepMs=parseInt(localStorage.getItem('tagSnapMinSep')||'20',10);
+let snapShow=localStorage.getItem('tagSnapShow')==='1';
+const $=id=>document.getElementById(id);
+
+// Nothing in this page used to say when it broke. boot() is fired and forgotten, so a
+// single failed fetch left a half-drawn screen and no message -- indistinguishable, from
+// the outside, from a page that is merely slow. Every error now names itself on screen.
+function fail(msg){
+  let b=$('pageErr');
+  if(!b){
+    b=document.createElement('div');
+    b.id='pageErr';
+    b.onclick=()=>{b.style.display='none';};
+    document.body.insertBefore(b,document.body.firstChild);
+  }
+  b.textContent=msg+'  — click to dismiss';
+  b.style.display='block';
+  console.error(msg);
+}
+// The server stamps the build of the file it just served here. A browser running an older
+// copy out of its cache is the one failure this page cannot detect by looking at itself --
+// it worked, against a server that had moved on. So it asks, once, and reloads past the
+// cache if the answer differs. The sessionStorage guard is what stops a proxy that keeps
+// serving the old copy from turning this into a reload loop.
+// main.js is served from static/ and cache-busted by its content hash, so it cannot carry
+// the build placeholder itself -- substituting it here would change the very bytes whose
+// hash decides the build. The one substitution page() still does lands in the HTML instead,
+// in a global this file only reads.
+const BUILD=window.PAGE_BUILD;
+async function checkBuild(){
+  try{
+    const d=await (await fetch('/api/progress',{cache:'no-store'})).json();
+    if(!d.build || d.build===BUILD) return false;
+    const seen='reloaded-for-'+d.build;
+    if(sessionStorage.getItem(seen)){
+      fail('This page is an old copy (build '+BUILD+', the server has '+d.build
+        +') and reloading did not replace it. Press Ctrl+Shift+R.');
+      return false;
+    }
+    sessionStorage.setItem(seen,'1');
+    const u=new URL(location.href);
+    u.searchParams.set('b',d.build);
+    location.replace(u.toString());
+    return true;
+  }catch(e){ return false; }
+}
+addEventListener('error',e=>fail('The page hit an error: '+(e.message||e.error)));
+addEventListener('unhandledrejection',e=>{
+  const r=e.reason;
+  fail('The page hit an error: '+((r&&r.message)||r));
+});
+
+const f3=t=>t.toFixed(3);
+const mmss=t=>{t=Math.max(0,t);return Math.floor(t/60)+':'+(t%60).toFixed(2).padStart(5,'0');};
+
+const NAME=/^[A-Za-z0-9_-]{1,32}$/;
+
+let ME=null;
+let isReadOnly=false, currentClipDetail=null, overviewData=null;
+
+function setUrlParam(key, val){
+  const u=new URL(location.href);
+  if(val!==null && val!==undefined) u.searchParams.set(key,val);
+  else u.searchParams.delete(key);
+  history.pushState(null,'',u.pathname+u.search);
+}
+
+// What each aligner is, so the table reads without a lookup.
+const ALIGNER_DESC={
+  'wav2vec2-hebrew':'CTC forced alignment &mdash; imvladikon/wav2vec2-xls-r-300m-hebrew',
+  mms:'CTC forced alignment &mdash; Meta MMS, 1,130 languages, romanized',
+  'mms-corrected':'MMS, then a shift per letter class and, before a pause, the end extended to where the sound stops',
+  'whisper-stable-ts':'stable-ts align on faster-whisper &mdash; ivrit.ai whisper-large-v3-turbo',
+  'mwa-buckeye':'Multilingual Word Aligner, buckeye checkpoint (arXiv 2606.10675) &mdash; the align button',
+  'ivrit-ai':'timings shipped with the dataset (Whisper + stable-ts), not re-run here',
+};
+const fmtMs=v=>(v==null?'&ndash;':Math.round(v)+' ms');
+const errClass=v=>v==null?'':(v<=50?'evGood':(v<=100?'evMid':'evBad'));
+
+let EVAL_LIST=[], EVAL_CUR=null, EVAL_DATA=null;
+
+async function showEval(pick){
+  stop(); cancelAlign();
+  $('workspace').style.display='none';
+  $('overviewScreen').classList.remove('on');
+  $('overviewLink').classList.remove('cur');
+  $('evalScreen').classList.add('on');
+  $('evalLink').classList.add('cur');
+  $('taggingLink').style.display='';
+  setUrlParam('view','eval');
+  setUrlParam('clip',null);
+  $('evDlMarks').href=api('/api/export');
+  let d;
+  try{
+    const r=await fetch(api('/api/eval-results'));
+    if(!r.ok){ $('evSummary').textContent='Could not list results ('+r.status+').'; return; }
+    d=await r.json();
+  }catch(e){ $('evSummary').textContent='Could not reach the server.'; return; }
+  EVAL_LIST=d.results||[];
+  $('evUpWrap').hidden=!d.can_upload;
+  $('evDeleteBtn').style.display=EVAL_LIST.length?'':'none';
+  const want=pick||new URL(location.href).searchParams.get('result')||EVAL_CUR;
+  const cur=EVAL_LIST.find(e=>e.id===want)||EVAL_LIST[0];
+  $('evPick').innerHTML=EVAL_LIST.map(e=>'<option value="'+e.id+'">'
+    +String(e.title||e.id).replace(/</g,'&lt;')+' &middot; '+(e.created_at||e.uploaded_at||'').slice(0,10)
+    +'</option>').join('');
+  if(!cur){
+    EVAL_CUR=null; EVAL_DATA=null;
+    $('evDlResults').style.display='none';
+    $('evMeta').textContent='';
+    renderEval({});
+    $('evSummary').textContent='No results uploaded yet.'+(d.can_upload?' Upload a result.json from eval-forced-alignment.':'');
+    return;
+  }
+  $('evPick').value=cur.id;
+  await loadEvalResult(cur.id);
+}
+
+async function loadEvalResult(id){
+  $('evSummary').textContent='Loading...';
+  const url=api('/api/eval-results/'+encodeURIComponent(id));
+  $('evDlResults').href=url; $('evDlResults').style.display='';
+  $('evDlResults').download=id+'.json';
+  let d;
+  try{
+    const r=await fetch(url);
+    if(!r.ok){ $('evSummary').textContent='Could not load that result ('+r.status+').'; return; }
+    d=await r.json();
+  }catch(e){ $('evSummary').textContent='Could not load that result.'; return; }
+  EVAL_CUR=id; EVAL_DATA=d;
+  setUrlParam('result',id);
+  renderEvalMeta(d);
+  renderEval(d);
+}
+
+// Where the result came from, and which aligners it could not run, so a missing row says why.
+function renderEvalMeta(d){
+  const esc=v=>String(v==null?'':v).replace(/[&<]/g,c=>c==='&'?'&amp;':'&lt;');
+  const inp=d.input||{};
+  let m='Input: <b>'+esc(inp.ref)+'</b>'+(inp.revision?' @ <code>'+esc(String(inp.revision).slice(0,12))+'</code>':'')
+    +(inp.rows!=null?' &middot; '+inp.rows+' marks on '+inp.clips+' clips':'')
+    +' &middot; computed '+esc((d.created_at||'').replace('T',' ').slice(0,16))
+    +(d.producer&&d.producer.git?' by eval-forced-alignment <code>'+esc(d.producer.git)+'</code>':'');
+  const st=d.aligner_status||{};
+  const off=Object.entries(st).filter(([,s])=>s.status!=='ok'&&s.status!=='imported');
+  if(off.length) m+='<br>Not scored: '+off.map(([n,s])=>'<b>'+esc(n)+'</b> ('+esc(s.reason||s.status)+')').join('; ');
+  const imp=Object.entries(st).filter(([,s])=>s.status==='imported');
+  if(imp.length) m+='<br>Aligned on another machine: '+imp.map(([n,s])=>esc(n)
+    +(s.provenance&&s.provenance.host?' on '+esc(s.provenance.host):'')).join(', ');
+  const failed=Object.entries(st).filter(([,s])=>s.failed&&s.failed.length);
+  if(failed.length) m+='<br>Clips an aligner could not align: '+failed.map(([n,s])=>esc(n)+' '+s.failed.length).join(', ');
+  $('evMeta').innerHTML=m;
+}
+
+$('evPick').onchange=()=>loadEvalResult($('evPick').value);
+$('evUploadBtn').onclick=()=>$('evUpload').click();
+$('evUpload').onchange=async()=>{
+  const f=$('evUpload').files[0]; $('evUpload').value='';
+  if(!f) return;
+  $('evSummary').textContent='Uploading '+f.name+'...';
+  try{
+    const r=await fetch(api('/api/eval-results'),{method:'POST',headers:{'Content-Type':'application/json'},body:await f.text()});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){ $('evSummary').textContent='Upload refused: '+(d.error||r.status); return; }
+    await showEval(d.id);
+  }catch(e){ $('evSummary').textContent='Upload failed: '+e; }
+};
+$('evDeleteBtn').onclick=async()=>{
+  if(!EVAL_CUR||!confirm('Delete this result from the site? The file itself is not affected.')) return;
+  const r=await fetch(api('/api/eval-results/delete'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:EVAL_CUR})});
+  if(!r.ok){ alert('Could not delete ('+r.status+')'); return; }
+  EVAL_CUR=null; setUrlParam('result',null);
+  await showEval();
+};
+
+// The result's own alignments for a clip, as lanes: those are what was scored, and the
+// dataset's labels may be older runs or absent. The first annotator's words are used when
+// several people marked the clip, since each got their own alignment.
+function evalLanes(id){
+  const c=EVAL_DATA&&EVAL_DATA.clip_data&&EVAL_DATA.clip_data[id];
+  if(!c||!c.labels) return null;
+  return Object.entries(c.labels).map(([name,byWho])=>{
+    const who=Object.keys(byWho).sort()[0];
+    return {source:name, words:byWho[who]};
+  }).filter(l=>l.words&&l.words.length);
+}
+
+function renderEval(d){
+  const people=Object.entries(d.annotators||{}).map(([n,c])=>n+' '+c).join(', ');
+  $('evSummary').innerHTML=d.marked_clips
+    ? '<b>'+d.marked_clips+'</b> clips marked by '+people
+      +(d.left_out&&d.left_out.length?' &middot; left out (test accounts): '+d.left_out.join(', '):'')
+    : 'No marked clips yet.';
+  const ranked=Object.entries(d.aligners||{}).filter(([,s])=>s.boundaries)
+    .sort((a,b)=>a[1].p90_ms-b[1].p90_ms);
+  if(!ranked.length){
+    $('evTable').innerHTML='<tr><td class="evEmpty">Nothing scored in this result.</td></tr>';
+    $('evBars').innerHTML=''; $('evClips').innerHTML=''; $('evLegend').textContent='';
+    $('evSig').innerHTML=''; $('evWarn').hidden=true;
+    return;
+  }
+  // A value with its 95% interval underneath, from resampling clips.
+  const withCi=(v,ci,unit)=>{
+    const main=(v==null?'&ndash;':(unit==='%'?v+'%':Math.round(v)+' ms'));
+    if(!ci) return main;
+    const lo=unit==='%'?ci[0]:Math.round(ci[0]), hi=unit==='%'?ci[1]:Math.round(ci[1]);
+    return main+'<span class="evCi">'+lo+'&ndash;'+hi+'</span>';
+  };
+  const TOL=[10,25,50,100];
+  const row=(name,s,cls)=>{
+    const ci=s.ci||{}, e=s.ends||{};
+    const seedTag=(d.seed&&name===d.seed)?'<span class="evSeed">marks started here &mdash; flattered</span>':'';
+    const desc=((d.aligner_status||{})[name]||{}).description||ALIGNER_DESC[name];
+    return '<tr class="'+cls+'"><td><span class="evName">'+name+'</span>'
+      +(desc?'<span class="evDesc">'+desc+'</span>':'')+seedTag+'</td>'
+      +'<td class="'+errClass(s.median_ms)+'">'+withCi(s.median_ms,ci.median_ms,'ms')+'</td>'
+      +'<td class="'+errClass(s.p90_ms)+'">'+withCi(s.p90_ms,ci.p90_ms,'ms')+'</td>'
+      +TOL.map(x=>'<td>'+withCi(s['within_'+x+'ms'],ci['within_'+x+'ms'],'%')+'</td>').join('')
+      +'<td class="evEnds '+errClass(e.median_ms)+'">'+fmtMs(e.median_ms)+'</td>'
+      +'<td class="evEnds '+errClass(e.p90_ms)+'">'+fmtMs(e.p90_ms)+'</td>'
+      +'<td class="evEnds">'+(e.within_50ms!=null?e.within_50ms+'%':'&ndash;')+'</td>'
+      +(hasUnmoved?'<td>'+(s.unmoved_pct!=null?s.unmoved_pct+'%':'&ndash;')+'</td>':'')+'</tr>';
+  };
+  const hasUnmoved=ranked.some(([,s])=>s.unmoved_pct!=null);
+  let t='<tr><th>aligner</th><th>median</th><th>p90</th>'
+    +TOL.map(x=>'<th>&le;'+x+' ms</th>').join('')
+    +'<th class="evEnds" title="Word ends only. MWA predicts nothing else: its starts are '
+    +'copied from the end of the word before it by its own writer, so this is the fair '
+    +'column">ends: median</th><th class="evEnds">ends: p90</th>'
+    +'<th class="evEnds">ends: &le;50 ms</th>'
+    +(hasUnmoved?'<th title="Human boundaries left exactly where this aligner put them">unmoved</th>':'')+'</tr>';
+  ranked.forEach(([n,s],i)=>{ t+=row(n,s,i===0&&n!==d.seed?'best':''); });
+  const h=d.human_agreement;
+  if(h){
+    const hc=h.ci||{};
+    t+='<tr class="floor"><td>two humans, same clip<span class="evDesc">'+h.boundaries
+      +' boundaries, '+(h.clips||'?')+' clips</span></td><td>'+withCi(h.median_ms,hc.median_ms,'ms')
+      +'</td><td>'+withCi(h.p90_ms,hc.p90_ms,'ms')+'</td>'
+      +TOL.map(x=>'<td>'+withCi(h['within_'+x+'ms'],hc['within_'+x+'ms'],'%')+'</td>').join('')
+      +'<td class="evEnds">'+fmtMs((h.ends||{}).median_ms)+'</td>'
+      +'<td class="evEnds">'+fmtMs((h.ends||{}).p90_ms)+'</td>'
+      +'<td class="evEnds">'+(((h.ends||{}).within_50ms!=null)?h.ends.within_50ms+'%':'&ndash;')+'</td>'
+      +(hasUnmoved?'<td></td>':'')+'</tr>';
+  }
+  $('evTable').innerHTML=t;
+  renderSignificance(d);
+
+  $('evBars').innerHTML=ranked.map(([n,s])=>'<div class="evBar"><span>'+n+'</span>'
+    +'<div class="evTrack"><div class="evFill" style="width:'+s.within_100ms+'%"></div>'
+    +(h?'<div class="evFloor" style="left:'+h.within_100ms+'%"></div>':'')+'</div>'
+    +'<span>'+s.within_100ms+'%</span></div>').join('');
+  $('evLegend').textContent=h
+    ? 'White line: two people on the same clip agree within 100 ms on '+h.within_100ms+'% of boundaries.'
+    : 'No clip has been marked by two people yet, so there is no human reference line.';
+
+  const names=ranked.map(([n])=>n);
+  const clipsRows=Object.entries(d.clips||{}).map(([id,c])=>{
+    const vals=names.map(n=>c[n]).filter(v=>v!=null);
+    return {id,c,worst:vals.length?Math.max(...vals):-1};
+  }).sort((a,b)=>b.worst-a.worst);
+  let ct='<tr><th></th><th>clip</th><th>recording</th>'+names.map(n=>'<th>'+n+'</th>').join('')+'</tr>';
+  clipsRows.forEach(({id,c})=>{
+    ct+='<tr class="clip" data-id="'+id+'"><td><a class="evOpen" href="?clip='+encodeURIComponent(id)
+      +'&aligners=all" title="Open this clip with every aligner shown">open &#9656;</a></td><td><span class="evText">'
+      +String(c._text||'').replace(/</g,'&lt;')+'</span></td><td>'+(c._recording||'')+'</td>'
+      +names.map(n=>'<td class="'+errClass(c[n])+'">'+fmtMs(c[n])+'</td>').join('')+'</tr>';
+  });
+  $('evClips').innerHTML=ct;
+  $('evClips').querySelectorAll('tr.clip').forEach(tr=>{
+    tr.onclick=e=>{
+      // A plain click opens in place; ctrl/cmd-click on the link opens a new tab as usual.
+      if(e.target.closest('a')&&(e.ctrlKey||e.metaKey||e.shiftKey)) return;
+      e.preventDefault();
+      alnForceAll=true; alnSig=null;
+      $('evalScreen').classList.remove('on'); $('evalLink').classList.remove('cur');
+      openClip(tr.dataset.id, false, evalLanes(tr.dataset.id));
+    };
+  });
+}
+
+// The seed warning and the pairwise tests. Kept apart from the main table so the numbers
+// and the question "should I believe this ranking?" read as separate things.
+function renderSignificance(d){
+  const w=$('evWarn');
+  const seed=d.seed, ss=seed&&d.aligners&&d.aligners[seed];
+  if(ss && ss.unmoved_pct!=null){
+    w.hidden=false;
+    w.innerHTML='<b>Not a fair test for '+seed+'.</b> The tool opens every clip on '+seed
+      +'\'s boundaries, and '+ss.unmoved_pct+'% of the human boundaries were never moved. '
+      +'Each of those counts as '+seed+' being exactly right, whether anyone checked it or '
+      +'not, so its scores are flattered. A comparison it <i>wins</i> may owe the win to that; '
+      +'one it <i>loses</i> was lost despite it, and still holds.';
+  } else w.hidden=true;
+
+  const tests=d.comparisons||[];
+  if(!tests.length){
+    $('evSig').innerHTML='<tr><td class="evEmpty">Needs at least two aligners scored on the same clips.</td></tr>';
+    return;
+  }
+  const label={p90_ms:'p90',within_50ms:'within 50 ms'};
+  let s='<tr><th>comparison</th><th>measure</th><th>difference</th><th>95% interval</th>'
+    +'<th>p (corrected)</th><th>verdict</th></tr>';
+  tests.forEach(t=>{
+    const unit=t.metric.startsWith('within_')?' pts':' ms';
+    const verdict=t.significant
+      ?'<span class="evYes">real &mdash; '+t.better+' is better</span>'
+      :'<span class="evNo">could be chance</span>';
+    const unfair=t.fair===false
+      ?'<span class="evUnfair">unfair: marks started from '+seed+'</span>'
+      :(t.seed_lost_anyway?'<span class="evRobust">holds despite '+seed+'\'s head start</span>':'');
+    const basis=t.edges==='end'?'<span class="evEndsTag">ends only</span>':'';
+    s+='<tr><td>'+t.a+' vs '+t.b+unfair+'</td><td>'+(label[t.metric]||t.metric)+basis+'</td>'
+      +'<td>'+(t.diff>0?'+':'')+t.diff+unit+'</td><td>'+t.ci[0]+' to '+t.ci[1]+'</td>'
+      // No redrawn sample crossed zero: that bounds p below the resolution of the draws,
+      // it does not make it zero.
+      +'<td>'+(t.p_holm===0?'&lt; 0.001':t.p_holm)+'</td><td>'+verdict+'</td></tr>';
+  });
+  $('evSig').innerHTML=s;
+}
+
+async function showOverview(){
+  stop(); cancelAlign();
+  $('evalScreen').classList.remove('on');
+  $('evalLink').classList.remove('cur');
+  $('workspace').style.display='none';
+  $('overviewScreen').classList.add('on');
+  $('overviewLink').classList.add('cur');
+  $('taggingLink').style.display='';
+  setUrlParam('view','overview');
+  setUrlParam('clip',null);
+  await loadOverview();
+}
+
+async function loadOverview(){
+  try{
+    const r=await fetch(api('/api/overview'));
+    if(!r.ok){ alert('Failed to load overview ('+r.status+')'); return; }
+    overviewData=await r.json();
+    renderOverviewStats();
+    populateOverviewFilters();
+    renderOverviewList();
+  }catch(err){
+    console.error(err);
+  }
+}
+
+function renderOverviewStats(){
+  if(!overviewData||!overviewData.stats) return;
+  const s=overviewData.stats;
+  $('ovDatasetName').textContent=overviewData.dataset||'-';
+  $('statOverallClips').textContent=s.overall_clips;
+  $('statOverallMin').textContent=s.overall_minutes+'m';
+  $('statSavedClips').textContent=s.saved_clips;
+  const savedPct=s.overall_clips?Math.round((s.saved_clips/s.overall_clips)*100):0;
+  $('statSavedPct').textContent=savedPct+'% of overall';
+  $('statSavedMin').textContent=s.saved_minutes+'m';
+  const savedMinPct=s.overall_minutes?Math.round((s.saved_minutes/s.overall_minutes)*100):0;
+  $('statSavedMinPct').textContent=savedMinPct+'% of overall';
+  $('statDoneClips').textContent=s.done_clips;
+  const donePct=s.overall_clips?Math.round((s.done_clips/s.overall_clips)*100):0;
+  $('statDonePct').textContent=donePct+'% of overall';
+  $('statDoneMin').textContent=s.done_minutes+'m';
+  const doneMinPct=s.overall_minutes?Math.round((s.done_minutes/s.overall_minutes)*100):0;
+  $('statDoneMinPct').textContent=doneMinPct+'% of overall';
+}
+
+function populateOverviewFilters(){
+  const userSelect=$('ovFilterUser');
+  const prevVal=userSelect.value;
+  userSelect.innerHTML='<option value="all">All claimants</option><option value="unclaimed">Unclaimed</option>';
+  if(overviewData&&overviewData.annotators){
+    overviewData.annotators.forEach(u=>{
+      const opt=document.createElement('option');
+      opt.value=u;
+      opt.textContent=u+(u===WHO?' (you)':'');
+      userSelect.appendChild(opt);
+    });
+  }
+  userSelect.value=prevVal||'all';
+}
+
+function renderOverviewList(){
+  if(!overviewData||!overviewData.clips) return;
+  const doneFilter=$('ovFilterDone').value;
+  const userFilter=$('ovFilterUser').value;
+  const sortFilter=$('ovSort').value;
+  const searchFilter=($('ovSearch').value||'').trim().toLowerCase();
+
+  let filtered=overviewData.clips.filter(c=>{
+    if(doneFilter==='done' && !c.done) return false;
+    if(doneFilter==='not_done' && c.done) return false;
+    if(userFilter==='unclaimed' && c.claimant) return false;
+    if(userFilter!=='all' && userFilter!=='unclaimed' && c.claimant!==userFilter) return false;
+    if(searchFilter){
+      const matchId=c.id.toLowerCase().includes(searchFilter);
+      const matchText=(c.text||'').toLowerCase().includes(searchFilter);
+      if(!matchId && !matchText) return false;
+    }
+    return true;
+  });
+
+  if(sortFilter==='dur_asc'){
+    filtered.sort((a,b)=>a.duration-b.duration);
+  }else if(sortFilter==='dur_desc'){
+    filtered.sort((a,b)=>b.duration-a.duration);
+  }
+
+  $('ovCount').textContent='Showing '+filtered.length+' of '+overviewData.clips.length+' clips';
+
+  const list=$('ovList');
+  list.innerHTML='';
+  if(!filtered.length){
+    list.innerHTML='<div style="color:#8a8f98;padding:20px;text-align:center">No matching clips found</div>';
+    return;
+  }
+
+  filtered.forEach((c,idx)=>{
+    const row=document.createElement('div');
+    row.className='ovRow'+(c.claimed_by_me?' isMe':'');
+
+    const iSpan=document.createElement('span');
+    iSpan.className='ovIdx';
+    iSpan.textContent=(idx+1)+'.';
+
+    const idSpan=document.createElement('span');
+    idSpan.className='ovId';
+    idSpan.textContent=c.id.slice(0,8);
+    idSpan.title=c.id;
+
+    const textSpan=document.createElement('span');
+    textSpan.className='ovText';
+    textSpan.textContent=c.text||c.id;
+    textSpan.title=c.text||c.id;
+
+    const durSpan=document.createElement('span');
+    durSpan.className='ovDur';
+    durSpan.textContent=mmss(c.duration);
+
+    const statusSpan=document.createElement('span');
+    statusSpan.className='ovStatus';
+    if(c.done){
+      statusSpan.innerHTML='<span class="savedBadge done on">done</span>';
+    }else if(c.saved){
+      const whoList=c.saved_by&&c.saved_by.length?c.saved_by.join(', '):'';
+      statusSpan.innerHTML='<span class="savedBadge on" title="Saved by: '+(whoList||'yes')+'">saved</span>';
+    }
+    if(c.claimant){
+      const clPill=document.createElement('span');
+      clPill.className='savedBadge';
+      clPill.textContent=c.claimed_by_me?'claimed by you':c.claimant;
+      if(c.claimed_by_me) clPill.style.color='#6aa0ff';
+      statusSpan.appendChild(clPill);
+    }else{
+      const unPill=document.createElement('span');
+      unPill.className='savedBadge';
+      unPill.textContent='unclaimed';
+      statusSpan.appendChild(unPill);
+    }
+
+    const actDiv=document.createElement('div');
+    actDiv.className='ovActions';
+
+    if(c.claimed_by_me){
+      const editBtn=document.createElement('button');
+      editBtn.className='btnEdit';
+      editBtn.textContent='Edit';
+      editBtn.onclick=()=>openClip(c.id, false);
+
+      const viewBtn=document.createElement('button');
+      viewBtn.className='btnView';
+      viewBtn.textContent='View';
+      viewBtn.onclick=()=>openClip(c.id, true);
+
+      actDiv.append(editBtn, viewBtn);
+    }else{
+      if(c.claimable){
+        const claimBtn=document.createElement('button');
+        claimBtn.className='btnClaim';
+        claimBtn.textContent='Claim';
+        claimBtn.onclick=()=>claimClip(c.id);
+        actDiv.appendChild(claimBtn);
+      }
+      const viewBtn=document.createElement('button');
+      viewBtn.className='btnView';
+      viewBtn.textContent='View';
+      viewBtn.onclick=()=>openClip(c.id, true);
+      actDiv.appendChild(viewBtn);
+    }
+
+    row.append(iSpan, idSpan, textSpan, durSpan, statusSpan, actDiv);
+    list.appendChild(row);
+  });
+}
+
+async function claimClip(key){
+  try{
+    const r=await fetch(api('/api/claim'),{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key})
+    });
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok){
+      alert(j.error||'Failed to claim clip');
+      return;
+    }
+    await openClip(key, false);
+  }catch(err){
+    alert('Failed to claim clip: '+err);
+  }
+}
+
+async function openClip(key, forceReadOnly, extraLanes){
+  stop(); cancelAlign();
+  const r=await fetch(api('/api/clip-marks?key='+encodeURIComponent(key)));
+  if(!r.ok){
+    alert('Could not load clip ('+r.status+')');
+    return;
+  }
+  const data=await r.json();
+  if(extraLanes&&extraLanes.length){
+    // An eval result's alignment replaces the dataset's label of the same name: it is the
+    // one the numbers on the eval screen were computed from.
+    const over=new Set(extraLanes.map(l=>l.source));
+    data.labels=[...(data.labels||[]).filter(l=>!over.has(l.source)),...extraLanes];
+  }
+  currentClipDetail=data;
+
+  const isMine=Boolean(data.claim&&data.claim.claimed_by_me);
+  isReadOnly=(forceReadOnly || !isMine);
+
+  $('overviewScreen').classList.remove('on');
+  $('evalScreen').classList.remove('on');
+  $('evalLink').classList.remove('cur');
+  $('workspace').style.display='block';
+  $('overviewLink').classList.remove('cur');
+  $('taggingLink').style.display='';
+  setUrlParam('clip', key);
+  setUrlParam('view', null);
+
+  if(isReadOnly){
+    $('readOnlyBanner').style.display='flex';
+    let claimText='Unclaimed';
+    if(data.claim&&data.claim.claimant){
+      claimText='Claimed by '+(data.claim.claimed_by_me?'you':data.claim.claimant)
+        +(data.claim.done?' (done)':'');
+    }
+    $('readOnlyClaimInfo').textContent=claimText;
+
+    const select=$('roMarksSelect');
+    select.innerHTML='';
+    const baseOpt=document.createElement('option');
+    baseOpt.value='__baseline__';
+    baseOpt.textContent='Baseline (aligner)';
+    select.appendChild(baseOpt);
+
+    const markKeys=Object.keys(data.marks||{});
+    markKeys.forEach(ann=>{
+      const opt=document.createElement('option');
+      opt.value=ann;
+      opt.textContent=ann+(ann===WHO?' (your marks)':'');
+      select.appendChild(opt);
+    });
+
+    let defaultChoice='__baseline__';
+    if(data.claim&&data.claim.claimant&&data.marks&&data.marks[data.claim.claimant]){
+      defaultChoice=data.claim.claimant;
+    }else if(markKeys.length){
+      defaultChoice=markKeys[0];
+    }
+    select.value=defaultChoice;
+
+    select.onchange=()=>{
+      const choice=select.value;
+      let wordsToUse=data.words;
+      if(choice!=='__baseline__'&&data.marks&&data.marks[choice]){
+        wordsToUse=data.marks[choice];
+      }
+      gold=wordsToUse.map(w=>({word:w.word,start:w.start,end:w.end,was:w.was,added:w.added}));
+      touched=new Set();
+      buildWords();
+      draw();
+      render();
+    };
+
+    if(data.claim&&data.claim.claimable){
+      $('roClaimBtn').style.display='';
+      $('roClaimBtn').onclick=()=>claimClip(key);
+    }else{
+      $('roClaimBtn').style.display='none';
+    }
+
+    if(isMine){
+      $('roEditBtn').style.display='';
+      $('roEditBtn').onclick=()=>openClip(key, false);
+    }else{
+      $('roEditBtn').style.display='none';
+    }
+
+    $('roBackOvBtn').onclick=showOverview;
+    setClipActionsVisible(false);
+  }else{
+    $('readOnlyBanner').style.display='none';
+    setClipActionsVisible(true);
+  }
+
+  let existingIndex=clips.findIndex(x=>(x.key||x.id)===key);
+  let initialSaved=null;
+  if(isReadOnly){
+    const choice=$('roMarksSelect').value;
+    if(choice!=='__baseline__'&&data.marks&&data.marks[choice]){
+      initialSaved=data.marks[choice];
+    }
+  }else{
+    initialSaved=(data.marks&&data.marks[WHO])||data.words;
+  }
+
+  if(existingIndex<0){
+    clips.push({
+      id: data.id,
+      key: data.id,
+      metadata: data.metadata||{},
+      text: data.text,
+      duration: data.duration,
+      words: data.words,
+      labels: data.labels,
+      saved: initialSaved,
+      done: data.claim?data.claim.done:false,
+      isExternal: true
+    });
+    ci=clips.length-1;
+  }else{
+    ci=existingIndex;
+    if(initialSaved) clips[ci].saved=initialSaved;
+  }
+
+  await loadClip();
+  startTick();
+}
+
+async function backToTagging(){
+  stop(); cancelAlign();
+  isReadOnly=false;
+  currentClipDetail=null;
+  $('readOnlyBanner').style.display='none';
+  $('overviewScreen').classList.remove('on');
+  $('evalScreen').classList.remove('on');
+  $('approveScreen').classList.remove('on');
+  $('evalLink').classList.remove('cur');
+  $('workspace').style.display='block';
+  $('overviewLink').classList.remove('cur');
+  $('taggingLink').style.display='none';
+  setClipActionsVisible(true);
+  setUrlParam('view', null);
+  setUrlParam('clip', null);
+  await load();
+}
+
+async function boot(){
+  if(await checkBuild()) return;   // an old copy; the reload is already on its way
+  let r;
+  try{ r=await fetch(api('/api/me')); }
+  catch(e){ return fail('Could not reach the server: '+e.message); }
+  if(!r.ok) return fail('The server refused the page ('+r.status+'). Try signing in again.');
+  try{ ME=await r.json(); }
+  catch(e){ return fail('The server sent something unreadable instead of your account.'); }
+  if(ME.migrate) return showMigrate();
+  if(ME.auth){
+    if(!ME.logged_in) return signIn();
+    // Signed in but no annotator name yet. The marks made before sign-in existed are filed
+    // under short names, so the first login gets to claim one rather than orphan the work.
+    if(!ME.name) return gate(true);
+    WHO=ME.name; return started();
+  }
+  const meta=await (await fetch(api('/api/meta'))).json();
+  if(meta.multi && !NAME.test(WHO)) return gate(false);
+  if(meta.multi) $('me').textContent='marking as '+WHO;
+  return load();
+}
+
+async function showApprovals(){
+  stop(); cancelAlign();
+  $('workspace').style.display='none';
+  $('overviewScreen').classList.remove('on');
+  $('evalScreen').classList.remove('on');
+  $('approveScreen').classList.add('on');
+  setUrlParam('view','approvals'); setUrlParam('clip',null);
+  let list=[];
+  try{
+    const r=await fetch(api('/api/waiting'));
+    if(!r.ok) return fail('Could not load the queue ('+r.status+').');
+    list=await r.json();
+  }catch(e){ return fail('Could not load the queue: '+e.message); }
+  if(!list.length){
+    $('appTable').innerHTML='<tr><td class="appNone">Nobody is waiting.</td></tr>';
+    return;
+  }
+  $('appTable').innerHTML='<tr><th>name</th><th>google account</th><th>since</th><th></th></tr>'
+    +list.map(p=>'<tr data-sub="'+p.sub+'"><td>'+p.name+'</td><td>'+(p.display||'')
+      +' &middot; '+(p.email||'')+'</td><td>'+(p.since||'').slice(0,10)
+      +'</td><td><button class="appBtn">let in</button></td></tr>').join('');
+  $('appTable').querySelectorAll('button').forEach(b=>{
+    b.onclick=async ()=>{
+      const tr=b.closest('tr'); b.disabled=true; b.textContent='...';
+      try{
+        const r=await fetch(api('/api/approve'),{method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({sub:tr.dataset.sub})});
+        if(!r.ok) throw new Error('the server said '+r.status);
+        tr.remove();
+        if(!$('appTable').querySelector('tr[data-sub]')) showApprovals();
+      }catch(e){ b.disabled=false; b.textContent='let in'; fail('Could not let them in: '+e.message); }
+    };
+  });
+}
+
+function showWaiting(){
+  $('gate').classList.remove('on');
+  $('workspace').style.display='none';
+  $('waitScreen').style.display='block';
+  $('waitWho').textContent='Signed in as '+((ME&&ME.display)||'')+
+    ((ME&&ME.email)?' ('+ME.email+')':'')+', filed under the name '+((ME&&ME.name)||'');
+  $('me').innerHTML='waiting for approval'
+    +(ME&&ME.logout_url?' &middot; <a href="'+ME.logout_url+'">sign out</a>':'');
+}
+
+function started(){
+  $('gate').classList.remove('on');
+  $('me').innerHTML='marking as <b>'+WHO+'</b>'
+    +(ME&&ME.display?' &middot; '+ME.display:'')
+    +(ME&&ME.logout_url?' &middot; <a href="'+ME.logout_url+'">sign out</a>':'');
+  if(ME&&ME.admin){
+    $('approveLink').style.display='';
+    $('approveLink').textContent='approvals'+(ME.waiting?' ('+ME.waiting+')':'');
+    $('approveLink').onclick=e=>{ e.preventDefault(); showApprovals(); };
+  }
+  // Someone still in the queue gets the read-only tour, not the tagging screen: every
+  // write is refused server-side anyway, and letting them mark for an hour before finding
+  // that out would be worse than saying so up front.
+  if(ME&&ME.auth&&ME.approved===false) return showWaiting();
+  load();
+}
+
+function signIn(){
+  const g=$('gate'); g.classList.add('on');
+  $('whoform').hidden=true;
+  $('gatetext').textContent='Sign in so your marks are yours: nobody else can save under '
+    +'your name, and you keep the same work across devices.';
+  const b=$('gsignin'); b.hidden=false;
+  // --local-auth stands in for the whole gate, including this label -- a real "Sign in
+  // with Google" button that does not talk to Google would be the confusing part.
+  b.textContent=(ME&&ME.local_auth)?'Sign in (local)':'Sign in with Google';
+  b.onclick=()=>{ location.href=ME.login_url; };
+}
+
+function showMigrate(){
+  const g=$('mgate'); g.classList.add('on');
+  $('miggo').onclick=async ()=>{
+    const b=$('miggo'); b.disabled=true; $('migerr').textContent='';
+    try{
+      const r=await fetch(api('/api/migrate'),{method:'POST'});
+      const j=await r.json().catch(()=>({}));
+      if(!r.ok){ $('migerr').textContent=j.error||('Migration failed ('+r.status+')');
+        b.disabled=false; return; }
+      $('migtext').textContent='Migration complete. Your marks were rewritten in place. '
+        +'Reload to start marking.';
+      b.textContent='Reload'; b.disabled=false;
+      b.onclick=()=>location.reload();
+    }catch(err){ $('migerr').textContent='Migration failed: '+err; b.disabled=false; }
+  };
+}
+
+function gate(authed){
+  const g=$('gate'); g.classList.add('on');
+  $('gsignin').hidden=true; $('whoform').hidden=false;
+  if(authed){
+    $('gatetext').textContent='Signed in as '+ME.display
+      +'. Pick the name your marks are filed under — if you have marked before, '
+      +'type that same name to claim your existing work.';
+    if(!$('whoin').value) $('whoin').value=(ME.email||'').split('@')[0].slice(0,32);
+  }
+  $('whoin').focus(); $('whoin').select();
+  const go=async ()=>{
+    const v=$('whoin').value.trim();
+    if(!NAME.test(v)){ $('whoerr').textContent=
+      'Letters, digits, - and _ only, up to 32 characters.'; return; }
+    if(authed){
+      const r=await fetch(api('/api/claim-name'),{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({name:v})});
+      if(r.status===409){ $('whoerr').textContent=
+        'That name belongs to another account. Pick a different one.'; return; }
+      if(!r.ok){ $('whoerr').textContent='Could not save that name. Try again.'; return; }
+      // /api/me was fetched before this name existed, so the copy in ME is now stale --
+      // and it is what the waiting screen prints back at them.
+      WHO=v; if(ME) ME.name=v; return started();
+    }
+    WHO=v; localStorage.setItem('tagWho',v);
+    g.classList.remove('on'); $('me').textContent='marking as '+WHO;
+    load();
+  };
+  // A real form, so Enter submits the way it does in every other text box, rather than
+  // riding on a keydown handler.
+  $('whoform').onsubmit=e=>{ e.preventDefault(); go(); };
+}
+
+async function load(){
+  try{
+    const meta=await (await fetch(api('/api/meta'))).json();
+    if(meta && meta.aligner===false) $('alignBtn').title='Aligner disabled';
+  }catch(e){}
+  const v=PARAMS.get('view');
+  const cl=PARAMS.get('clip');
+  // The evaluation and the overview do not need the annotator's clip list, and a clip
+  // opened by id fetches its own. Letting this one call decide whether the page appears at
+  // all is what turned a slow dataset listing into a blank screen.
+  try{
+    const r=await fetch(api('/api/clips'));
+    if(!r.ok) throw new Error('/api/clips answered '+r.status);
+    clips=await r.json();
+  }catch(e){
+    clips=[];
+    if(v!=='overview' && v!=='eval' && !cl){ fail('The clip list did not load: '+e.message); return; }
+    fail('The clip list did not load ('+e.message+'); the rest of this page is unaffected.');
+  }
+  if(v==='overview'){
+    PARAMS.delete('view');
+    return showOverview();
+  }
+  if(v==='eval'){
+    PARAMS.delete('view');
+    return showEval();
+  }
+  if(v==='approvals'){
+    PARAMS.delete('view');
+    return showApprovals();
+  }
+  if(cl){
+    PARAMS.delete('clip');
+    const rid=PARAMS.get('result');
+    if(rid){
+      try{
+        const rr=await fetch(api('/api/eval-results/'+encodeURIComponent(rid)));
+        if(rr.ok){ EVAL_DATA=await rr.json(); EVAL_CUR=rid; }
+      }catch(e){}
+      return openClip(cl, false, evalLanes(cl));
+    }
+    return openClip(cl);
+  }
+  // Land on the clip last worked on but not finished: the most recent one the annotator
+  // saved without marking done. Fall back to the first clip with no marks at all.
+  ci=-1;
+  for(let i=0;i<clips.length;i++) if(clips[i].saved && !clips[i].done) ci=i;
+  if(ci<0) ci=clips.findIndex(c=>!c.saved);
+  if(ci<0) ci=0;
+  await loadClip(); startTick();
+}
+async function loadClip(){
+  stop();
+  const c=clips[ci];
+  if(!c) return;
+  gold=(c.saved||c.words).map(w=>({word:w.word,start:w.start,end:w.end,was:w.was,added:w.added}));
+  touched=new Set(c.saved?gold.map((_,i)=>i):[]);
+  wi=0; edge='end'; head=0;
+  specCanvas=null; snapPoints=[];
+  const r=await fetch(api('/api/audio/'+encodeURIComponent(c.key||c.id||ci))); lead=parseFloat(r.headers.get('X-Lead')||'0');
+  const ab=await r.arrayBuffer();
+  ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();
+  buf=await ctx.decodeAudioData(ab);
+  specCanvas=buildMelSpec(buf);
+  snapPoints=specCanvas?(specCanvas.snapPoints||[]):[];
+  peaks=null; view=null; stretchCache.clear(); draw(); render();
+}
+const total=()=>buf?buf.duration-lead:0;
+// The served audio starts `lead` seconds BEFORE the row, so time -lead is the first sample
+// that exists. Clamping marks at 0 made the leading context visible but unreachable, which
+// is wrong twice over: the row's own start came from the same aligner being judged, so the
+// true word start can genuinely lie before it. Everything drawn is now reachable.
+const tmin=()=>-lead;
+const mark=()=>edge==='end'?gold[wi].end:gold[wi].start;
+// Whether a word actually differs from what the source clip carried. Compared against the
+// original aligner values rather than a "was touched" flag, so a mark dragged and dragged
+// back reads as unmodified again, and a saved clip only shows green where it really moved.
+const srcWord=i=>{const s=clips[ci]&&clips[ci].words;return (s&&s[i])||null;};
+const modified=i=>{
+  const w=gold[i];
+  if(w.added) return true;
+  if(w.was!==undefined && w.was!==w.word) return true;
+  const s=srcWord(i);
+  if(!s) return true;
+  return Math.abs(w.start-s.start)>0.0005||Math.abs(w.end-s.end)>0.0005;
+};
+// Debounced "play the word whose mark just moved". Repeated nudges (shift+arrows, drag,
+// +-10ms) each touch the mark, so the word only plays once the marks settle -- a pause in
+// the motion means "done moving, now hear it".
+let playOnMark=true, markPlayTimer=null;
+function scheduleWordPlay(){
+  clearTimeout(markPlayTimer);
+  if(!playOnMark||loopKind) return;
+  markPlayTimer=setTimeout(()=>{ if(playOnMark&&gold.length) playWord(); },250);
+}
+
+// ---- transport -----------------------------------------------------------
+// Playback runs on the Web Audio clock, not on an <audio> element.
+//
+// The element reported exact times -- seeks landed to the microsecond and currentTime
+// advanced in ~6ms steps -- but a bounded region still took 50ms longer than it should at
+// 1x and 100ms at 0.5x, because play() and pause() are not instant. That slop is audible at
+// exactly the moment it matters: asking to hear "up to the mark" played past the mark, so
+// the boundary you are trying to judge is not the boundary you hear.
+//
+// A buffer source is scheduled instead: start(when, offset, duration) begins and ends in
+// the audio thread, sample-accurate, with nothing polling and no start-up cost per region.
+let srcNode=null, ctxT0=0, headT0=0;
+
+// Slower speeds still must not drop the pitch, and Web Audio has no time-stretch of its own
+// (playbackRate resamples, which is the pitch drop we removed earlier). So the buffer is
+// stretched once per speed, overlap-add with a short correlation search to keep successive
+// windows in phase, and then played at 1x. Cached: a clip is a few seconds and there are
+// four non-unity speeds.
+const stretchCache=new Map();
+function stretched(r){
+  if(r===1) return buf;
+  const key=r+'@'+ci;
+  if(stretchCache.has(key)) return stretchCache.get(key);
+  const sr=buf.sampleRate, inp=buf.getChannelData(0);
+  const N=Math.round(0.046*sr), Hs=N>>1, Ha=Math.max(1,Math.round(Hs*r));
+  const search=Math.round(0.008*sr);
+  const outLen=Math.ceil(inp.length/r)+N;
+  const out=new Float32Array(outLen);
+  const win=new Float32Array(N);
+  for(let i=0;i<N;i++) win[i]=0.5-0.5*Math.cos(2*Math.PI*i/(N-1));
+  let ai=0, si=0, prev=null;
+  while(ai+N<inp.length && si+N<outLen){
+    let at=Math.round(ai);
+    if(prev){
+      let bestScore=-Infinity, best=at;
+      const lo=Math.max(0,at-search), hi=Math.min(inp.length-N,at+search);
+      for(let c=lo;c<=hi;c+=2){
+        let acc=0;
+        for(let k=0;k<Hs;k+=4) acc+=inp[c+k]*prev[k];
+        if(acc>bestScore){bestScore=acc;best=c;}
+      }
+      at=best;
+    }
+    for(let k=0;k<N;k++) out[si+k]+=inp[at+k]*win[k];
+    prev=inp.subarray(at+Hs, at+Hs+Hs);
+    ai+=Ha; si+=Hs;
+  }
+  const b=ctx.createBuffer(1,outLen,sr);
+  b.copyToChannel(out,0);
+  stretchCache.set(key,b);
+  return b;
+}
+
+function now(){
+  if(!playing) return head;
+  return Math.max(tmin(), Math.min(headT0+(ctx.currentTime-ctxT0)*rate, total()));
+}
+function label(){ $('play').innerHTML = playing?'&#10074;&#10074; pause':'&#9654; play'; }
+function stop(){
+  if(playing) head=now();
+  if(srcNode){ srcNode.onended=null; try{srcNode.stop();}catch(e){} srcNode=null; }
+  playing=false; label();
+}
+function start(from,to){
+  if(!buf)return;
+  stop();
+  seg=(to!=null)?[from,to]:null;
+  head=Math.max(tmin(),Math.min(from,total()));
+  if(to!=null && to-head<=.01){draw();return;}
+  if(ctx.state==='suspended') ctx.resume();
+  const b=stretched(rate);
+  // App time -> offset in the (possibly stretched) buffer. Time 0 is `lead` into the clip,
+  // because PAD seconds of context are served before it.
+  const offset=(head+lead)/rate;
+  const dur=(to!=null? to-head : total()-head)/rate;
+  if(!(dur>0)) {draw();return;}
+  const src=ctx.createBufferSource();
+  src.buffer=b; src.connect(ctx.destination);
+  src.onended=()=>{
+    if(src!==srcNode) return;          // superseded by a newer region
+    srcNode=null;
+    if(loopKind){ const sp=loopSpan(); start(sp[0],sp[1]); return; }
+    playing=false; head=(to!=null)?to:total(); label(); draw();
+  };
+  src.start(ctx.currentTime, Math.max(0,offset), dur);
+  srcNode=src; ctxT0=ctx.currentTime; headT0=head;
+  playing=true; label();
+}
+function loopSpan(){
+  return loopKind==='word' ? [gold[wi].start,gold[wi].end]
+       : [Math.max(tmin(),mark()-.35), Math.min(total(),mark()+.35)];
+}
+function setLoop(kind){
+  loopKind=(loopKind===kind)?null:kind;
+  $('loopWord').classList.toggle('on',loopKind==='word');
+  $('loopMark').classList.toggle('on',loopKind==='mark');
+  if(loopKind){ const sp=loopSpan(); start(sp[0],sp[1]); } else stop();
+}
+function toggle(){
+  if(playing){ stop(); draw(); return; }
+  // Playing a region (word, up-to-mark, after-mark) leaves the playhead exactly at that
+  // region's end with seg still set, so the next press asked for a zero-length span and
+  // silently did nothing -- the transport looked frozen. Finishing a region falls back to
+  // free play, and reaching the end of the clip rewinds.
+  if(seg && head>=seg[1]-0.005) seg=null;
+  if(head>=total()-0.005) head=tmin();
+  start(head,seg?seg[1]:null);
+}
+function moveHead(t){
+  const wasPlaying=playing;
+  head=Math.max(tmin(),Math.min(t,total()));
+  if(wasPlaying){ start(head,null); return; }   // playing: restart from the new spot
+  seg=null; draw();                              // paused: just draw, no seek, no lag
+}
+const playWord  =()=>start(gold[wi].start,gold[wi].end);
+const playBefore=()=>start(Math.max(tmin(),mark()-.45),mark());
+const playAfter =()=>start(mark(),Math.min(total(),mark()+.45));
+
+// ---- waveform ------------------------------------------------------------
+function buildPeaks(w){
+  const d=buf.getChannelData(0),n=d.length; peaks=new Float32Array(w*2);
+  for(let x=0;x<w;x++){let lo=1,hi=-1;const s=Math.floor(x*n/w),e=Math.floor((x+1)*n/w);
+    for(let i=s;i<e;i++){const v=d[i];if(v<lo)lo=v;if(v>hi)hi=v;}
+    peaks[x*2]=lo;peaks[x*2+1]=hi;}
+}
+// ---- aligner lanes -------------------------------------------------------------------
+// Every aligner's own word boundaries for this clip, each in its own thin lane under your
+// marks, so where each one disagrees with you -- and with each other -- is visible directly
+// instead of only as a number on the eval page. Which lanes are on is remembered per browser.
+const ALN_COLORS={mms:'#4ec98a','ivrit-ai':'#d8a13a','whisper-stable-ts':'#c678dd',
+  'wav2vec2-hebrew':'#e06c6c','mwa-buckeye':'#56b6c2'};
+const ALN_FALLBACK=['#e5c07b','#61afef','#98c379','#be5046','#abb2bf'];
+function alnColor(src,i){ return ALN_COLORS[src]||ALN_FALLBACK[i%ALN_FALLBACK.length]; }
+let alnShown=new Set(), alnSig=null;
+try{ alnShown=new Set(JSON.parse(localStorage.getItem('alnShown')||'[]')); }catch(e){}
+// Opened from the eval dashboard: show every aligner, since comparing them is why you came.
+const ALN_ALL_FROM_URL=(new URLSearchParams(location.search).get('aligners')==='all');
+let alnForceAll=ALN_ALL_FROM_URL;
+function saveAln(){ try{ localStorage.setItem('alnShown',JSON.stringify([...alnShown])); }catch(e){} }
+
+function clipLabels(){
+  const d=(currentClipDetail&&currentClipDetail.labels)?currentClipDetail:(clips&&clips[ci]);
+  return (d&&d.labels)||[];
+}
+// Rebuilt only when the set of aligners changes, so it can be called from draw() cheaply.
+function renderAlnToggles(){
+  const labels=clipLabels();
+  const sig=labels.map(l=>l.source).join('|');
+  if(sig===alnSig) return;
+  alnSig=sig;
+  if(alnForceAll){ labels.forEach(l=>alnShown.add(l.source)); alnForceAll=false; saveAln(); }
+  $('alnBar').hidden=!labels.length;
+  $('alnToggles').innerHTML=labels.map((l,i)=>'<label class="alnT"><input type="checkbox" data-src="'
+    +l.source+'"'+(alnShown.has(l.source)?' checked':'')+'><i class="alnSw" style="background:'
+    +alnColor(l.source,i)+'"></i>'+l.source+'</label>').join('');
+  $('alnToggles').querySelectorAll('input').forEach(cb=>{
+    cb.onchange=()=>{ cb.checked?alnShown.add(cb.dataset.src):alnShown.delete(cb.dataset.src); saveAln(); draw(); };
+  });
+}
+function setAllAln(on){
+  clipLabels().forEach(l=>on?alnShown.add(l.source):alnShown.delete(l.source));
+  saveAln(); alnSig=null; renderAlnToggles(); draw();
+}
+
+// Paint the enabled lanes into the band [y0, y1) of a canvas, using its own time->x map.
+function paintAlnLanes(g,X,y0,y1,w,withNames){
+  const lanes=clipLabels().map((l,i)=>({l,i})).filter(o=>alnShown.has(o.l.source));
+  if(!lanes.length) return;
+  const laneH=(y1-y0)/lanes.length;
+  lanes.forEach(({l,i},k)=>{
+    const col=alnColor(l.source,i), top=y0+k*laneH, bh=Math.max(2,laneH-2);
+    g.globalAlpha=.55; g.fillStyle=col;
+    l.words.forEach(wd=>{ const a=X(wd.start), b=X(wd.end); if(b<0||a>w) return;
+      g.fillRect(a,top,Math.max(1,b-a),bh); });
+    g.globalAlpha=1;
+    // bright ticks at every boundary, so start and end read exactly
+    l.words.forEach(wd=>{ [wd.start,wd.end].forEach(t=>{ const x=X(t); if(x>=0&&x<=w) g.fillRect(Math.round(x),top,1,bh); }); });
+    if(withNames&&laneH>=8){
+      g.font='10px system-ui,sans-serif'; g.textBaseline='middle';
+      const tw=g.measureText(l.source).width+8;
+      g.fillStyle='rgba(20,22,26,.85)'; g.fillRect(w-tw-2,top,tw,bh);
+      g.fillStyle=col; g.fillText(l.source,w-tw+2,top+bh/2);
+    }
+  });
+  g.globalAlpha=1;
+}
+
+function drawOverview(){
+  const w=ov.clientWidth,h=90; ov.width=w*devicePixelRatio; ov.height=h*devicePixelRatio;
+  og.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0); og.clearRect(0,0,w,h);
+  if(!buf)return;
+  if(!peaks||peaks.length!==w*2) buildPeaks(w);
+  const dur=buf.duration, X=t=>(t+lead)/dur*w;
+  renderAlnToggles();
+  paintAlnLanes(og,X,h*.80,h,w,false);
+  gold.forEach((wd,i)=>{ og.fillStyle=(i===wi)?'rgba(61,111,214,.30)':'rgba(255,255,255,.03)';
+    og.fillRect(X(wd.start),0,Math.max(1,X(wd.end)-X(wd.start)),h); });
+  og.fillStyle='#2f3540';
+  for(let x=0;x<w;x++){const lo=peaks[x*2],hi=peaks[x*2+1];
+    og.fillRect(x,h/2+lo*h/2.2,1,Math.max(1,(hi-lo)*h/2.2));}
+  // Snap points (green lines) drawn under word marks
+  if(snapShow&&snapPoints&&snapPoints.length){
+    og.fillStyle='rgba(134,239,172,.65)';
+    snapPoints.forEach(t=>{ og.fillRect(Math.round(X(t)),h*.08,1,h*.84); });
+  }
+  // Non-active marks (grey)
+  gold.forEach((wd,i)=>{
+    if(i!==wi){ og.fillStyle='#48505e'; og.fillRect(Math.round(X(wd.end)),0,1,h); }
+  });
+  // Active mark (blue) - on top of green lines and grey marks
+  if(gold[wi]){ og.fillStyle='#6aa0ff'; og.fillRect(Math.round(X(gold[wi].end)),0,1,h); }
+  og.fillStyle='#ff5f56'; og.fillRect(X(now()),h*.15,2,h*.7);
+}
+// the zoom window always contains the WHOLE current word, so start and end are both reachable
+// The zoom window is explicit state, not a function of the word, so it can be dragged and
+// zoomed. It is refitted to the word whenever the word or clip changes, and nudged along by
+// ensureVisible when a mark is dragged past its edge.
+let view=null,dragging=false;
+let createDrag=null;   // {s,e} in-progress Ctrl+drag "create new word" span, in app time
+function fitWord(){
+  if(!gold||!gold.length||!gold[wi]){ view=[tmin(), Math.max(tmin()+0.12, total())]; return; }
+  view=[Math.max(tmin(),gold[wi].start-MARGIN), Math.min(total(),gold[wi].end+MARGIN)];
+  if(view[1]-view[0]<0.12) view[1]=view[0]+0.12;
+}
+function zwin(){ if(!view) fitWord(); return view || [tmin(), Math.max(tmin()+0.12, total())]; }
+function panBy(dt){
+  const [lo,hi]=view, span=hi-lo;
+  let a=lo+dt, b=hi+dt;
+  if(a<tmin()){a=tmin();b=a+span;}
+  if(b>total()){b=total();a=b-span;}
+  view=[a,b]; draw();
+}
+function zoomAt(t,f){
+  const [lo,hi]=view; let span=(hi-lo)*f;
+  span=Math.max(0.06,Math.min(span,total()-tmin()));
+  const frac=(t-lo)/(hi-lo);
+  let a=t-frac*span, b=a+span;
+  if(a<tmin()){a=tmin();b=a+span;}
+  if(b>total()){b=total();a=Math.max(tmin(),b-span);}
+  view=[a,b]; draw();
+}
+function ensureVisible(t){
+  // Never while a mark is being dragged. Panning there moves the window that the pointer
+  // position is converted through, so the mark chases its own new coordinates and sticks.
+  // During a drag only the edge timer pans, by a fixed step that does not depend on the
+  // pointer, which cannot feed back.
+  if(dragging) return;
+  const [lo,hi]=view, pad=(hi-lo)*0.12;
+  if(t<lo+pad) panBy(t-(lo+pad)); else if(t>hi-pad) panBy(t-(hi-pad));
+}
+// ---- mel spectrogram (0-5000 Hz) -------------------------------------------
+const SPEC_PALETTE = [
+  { p: 0.0,  r: 20,  g: 22,  b: 26 },   // matches app background #14161a
+  { p: 0.15, r: 35,  g: 30,  b: 65 },   // deep navy purple
+  { p: 0.35, r: 75,  g: 25,  b: 105 },  // rich violet
+  { p: 0.55, r: 165, g: 35,  b: 65 },   // vibrant magenta/crimson
+  { p: 0.75, r: 230, g: 95,  b: 30 },   // bright orange
+  { p: 0.90, r: 250, g: 200, b: 60 },   // bright warm yellow
+  { p: 1.0,  r: 255, g: 255, b: 240 }   // white/pale yellow
+];
+const SPEC_CMAP = new Uint8Array(256 * 3);
+for (let i = 0; i < 256; i++) {
+  const t = i / 255;
+  let idx = 0;
+  while (idx < SPEC_PALETTE.length - 1 && SPEC_PALETTE[idx + 1].p < t) idx++;
+  const c0 = SPEC_PALETTE[idx];
+  const c1 = SPEC_PALETTE[Math.min(idx + 1, SPEC_PALETTE.length - 1)];
+  const frac = c1.p === c0.p ? 0 : (t - c0.p) / (c1.p - c0.p);
+  SPEC_CMAP[i * 3]     = Math.round(c0.r + frac * (c1.r - c0.r));
+  SPEC_CMAP[i * 3 + 1] = Math.round(c0.g + frac * (c1.g - c0.g));
+  SPEC_CMAP[i * 3 + 2] = Math.round(c0.b + frac * (c1.b - c0.b));
+}
+
+const hzToMel = hz => 2595 * Math.log10(1 + hz / 700);
+const melToHz = mel => 700 * (Math.pow(10, mel / 2595) - 1);
+function freqToY(hz, height, maxHz) {
+  const m = hzToMel(Math.min(hz, maxHz));
+  const maxM = hzToMel(maxHz);
+  const frac = maxM > 0 ? m / maxM : 0;
+  return height * (1 - frac);
+}
+
+function runFft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let tr = re[i]; re[i] = re[j]; re[j] = tr;
+      let ti = im[i]; im[i] = im[j]; im[j] = ti;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const half = len >> 1;
+    const ang = -2 * Math.PI / len;
+    const wstepR = Math.cos(ang), wstepI = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let wr = 1, wi = 0;
+      for (let j = 0; j < half; j++) {
+        const tr = wr * re[i + j + half] - wi * im[i + j + half];
+        const ti = wr * im[i + j + half] + wi * re[i + j + half];
+        re[i + j + half] = re[i + j] - tr;
+        im[i + j + half] = im[i + j] - ti;
+        re[i + j] += tr;
+        im[i + j] += ti;
+        const nextWr = wr * wstepR - wi * wstepI;
+        wi = wr * wstepI + wi * wstepR;
+        wr = nextWr;
+      }
+    }
+  }
+}
+
+function prepareSnapDetector(data, numFrames, numBands, hop, sr, lead, n=4){
+  if(!data||numFrames<2*n) return null;
+  function l2(f1, f2){
+    let sumSq=0;
+    const o1=f1*numBands, o2=f2*numBands;
+    for(let m=0;m<numBands;m++){
+      const d=data[o1+m]-data[o2+m];
+      sumSq+=d*d;
+    }
+    return Math.sqrt(sumSq);
+  }
+
+  // 1. Stable baseline: 200 random pairs across audio
+  let sumDist=0;
+  const numPairs=200;
+  for(let i=0;i<numPairs;i++){
+    const f1=Math.floor(Math.random()*numFrames);
+    const f2=Math.floor(Math.random()*numFrames);
+    sumDist+=l2(f1, f2);
+  }
+  const rawBaseline=sumDist/numPairs;
+
+  // 2. Sliding window difference curve D (precomputed for all frames)
+  const D=new Float32Array(numFrames);
+  const avg1=new Float32Array(numBands);
+  const avg2=new Float32Array(numBands);
+
+  for(let f=0; f<=numFrames-2*n; f++){
+    for(let m=0;m<numBands;m++){
+      let s1=0, s2=0;
+      for(let i=0;i<n;i++){
+        s1+=data[(f+i)*numBands+m];
+        s2+=data[(f+n+i)*numBands+m];
+      }
+      avg1[m]=s1/n;
+      avg2[m]=s2/n;
+    }
+    let sumSq=0;
+    for(let m=0;m<numBands;m++){
+      const d=avg1[m]-avg2[m];
+      sumSq+=d*d;
+    }
+    D[f+n]=Math.sqrt(sumSq);
+  }
+
+  return { D, rawBaseline, numFrames, hop, sr, lead, n };
+}
+
+function refreshSnapPoints(shouldDraw=true){
+  if(!specData){ snapPoints=[]; return; }
+  const { D, rawBaseline, numFrames, hop, sr, lead, n } = specData;
+  const thresh = rawBaseline * snapThreshRatio;
+  const minSepFrames = Math.max(1, Math.round((snapMinSepMs/1000)*sr/hop));
+
+  // Local peak picking exceeding threshold
+  const peaks=[];
+  for(let f=n+1; f<numFrames-n-1; f++){
+    if(D[f]>thresh && D[f]>D[f-1] && D[f]>=D[f+1]){
+      peaks.push({frame:f, val:D[f], time:-lead+(f*hop)/sr});
+    }
+  }
+
+  // Suppress minor secondary peaks within minSepFrames
+  const filtered=[];
+  for(let i=0; i<peaks.length; i++){
+    const curr=peaks[i];
+    if(!filtered.length){
+      filtered.push(curr);
+    }else{
+      const prev=filtered[filtered.length-1];
+      if(curr.frame-prev.frame < minSepFrames){
+        if(curr.val > prev.val) filtered[filtered.length-1]=curr;
+      }else{
+        filtered.push(curr);
+      }
+    }
+  }
+
+  snapPoints = filtered.map(p=>p.time);
+  if($('snapThreshVal')) $('snapThreshVal').textContent = snapThreshRatio.toFixed(2);
+  if($('snapCountPill')) $('snapCountPill').textContent = snapPoints.length + ' snaps';
+  if(shouldDraw) draw();
+}
+
+function buildMelSpec(audioBuffer) {
+  if (!audioBuffer) return null;
+  const sr = audioBuffer.sampleRate;
+  const inp = audioBuffer.getChannelData(0);
+  const totalSamples = inp.length;
+  if (!totalSamples) return null;
+
+  // Pre-emphasis filter: boosts higher speech formants and bursts
+  const pre = new Float32Array(totalSamples);
+  pre[0] = inp[0];
+  for (let i = 1; i < totalSamples; i++) pre[i] = inp[i] - 0.97 * inp[i - 1];
+
+  const nFft = sr <= 24000 ? 512 : 1024;
+  const hop = Math.max(1, Math.round(sr * 0.005)); // 5ms hop for speech precision
+  const numBands = 80;
+  const maxHz = Math.min(5000, sr / 2);
+  const minHz = 0;
+  const maxBin = nFft >> 1;
+  const pad = nFft >> 1;
+  const numFrames = Math.floor(totalSamples / hop) + 1;
+
+  // Periodic Hann window
+  const win = new Float32Array(nFft);
+  for (let i = 0; i < nFft; i++) win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / nFft);
+
+  // Mel filterbank
+  const minMel = hzToMel(minHz);
+  const maxMel = hzToMel(maxHz);
+  const melStep = (maxMel - minMel) / (numBands + 1);
+  const binPoints = new Float32Array(numBands + 2);
+  for (let i = 0; i < numBands + 2; i++) {
+    binPoints[i] = (melToHz(minMel + i * melStep) * nFft) / sr;
+  }
+  const filters = [];
+  for (let m = 0; m < numBands; m++) {
+    const center = binPoints[m + 1], left = binPoints[m], right = binPoints[m + 2];
+    const kMin = Math.max(0, Math.floor(left)), kMax = Math.min(maxBin - 1, Math.ceil(right));
+    const weights = [];
+    for (let k = kMin; k <= kMax; k++) {
+      let w = 0;
+      if (k >= left && k <= center && center > left) w = (k - left) / (center - left);
+      else if (k > center && k <= right && right > center) w = (right - k) / (right - center);
+      if (w > 0) weights.push({ bin: k, w });
+    }
+    if (weights.length === 0) {
+      weights.push({ bin: Math.max(0, Math.min(maxBin - 1, Math.round(center))), w: 1.0 });
+    }
+    filters.push(weights);
+  }
+
+  const re = new Float32Array(nFft);
+  const im = new Float32Array(nFft);
+  const power = new Float32Array(maxBin);
+  const melSpec = new Float32Array(numFrames * numBands);
+  const linearMel = new Float32Array(numFrames * numBands);
+  let maxVal = -Infinity;
+
+  for (let f = 0; f < numFrames; f++) {
+    const centerSample = f * hop;
+    const startSample = centerSample - pad;
+    for (let i = 0; i < nFft; i++) {
+      const s = startSample + i;
+      re[i] = (s >= 0 && s < totalSamples ? pre[s] : 0) * win[i];
+      im[i] = 0;
+    }
+    runFft(re, im);
+    for (let k = 0; k < maxBin; k++) {
+      power[k] = re[k] * re[k] + im[k] * im[k];
+    }
+    for (let m = 0; m < numBands; m++) {
+      let sum = 0;
+      const flt = filters[m];
+      for (let j = 0; j < flt.length; j++) {
+        sum += power[flt[j].bin] * flt[j].w;
+      }
+      linearMel[f * numBands + m] = sum;
+      const val = Math.log10(sum + 1e-7);
+      melSpec[f * numBands + m] = val;
+      if (val > maxVal) maxVal = val;
+    }
+  }
+
+  const dynRange = 4.5; // 45 dB dynamic range
+  const minVal = maxVal - dynRange;
+  const normMel = new Float32Array(numFrames * numBands);
+
+  const offscreen = document.createElement('canvas');
+  offscreen.width = numFrames;
+  offscreen.height = numBands;
+  offscreen.maxHz = maxHz;
+  const offCtx = offscreen.getContext('2d');
+  const imgData = offCtx.createImageData(numFrames, numBands);
+  const data = imgData.data;
+
+  for (let f = 0; f < numFrames; f++) {
+    for (let m = 0; m < numBands; m++) {
+      const val = melSpec[f * numBands + m];
+      const norm = Math.max(0, Math.min(1, (val - minVal) / dynRange));
+      normMel[f * numBands + m] = norm;
+      const ci = Math.min(255, Math.floor(norm * 255));
+      const y = numBands - 1 - m; // 0Hz at bottom, 5000Hz at top
+      const pIdx = (y * numFrames + f) * 4;
+      data[pIdx]     = SPEC_CMAP[ci * 3];
+      data[pIdx + 1] = SPEC_CMAP[ci * 3 + 1];
+      data[pIdx + 2] = SPEC_CMAP[ci * 3 + 2];
+      data[pIdx + 3] = 255;
+    }
+  }
+  offCtx.putImageData(imgData, 0, 0);
+  specData = prepareSnapDetector(normMel, numFrames, numBands, hop, sr, lead, 4);
+  refreshSnapPoints(false);
+  offscreen.snapPoints = snapPoints;
+  return offscreen;
+}
+
+function drawWave(){
+  const w=wave.clientWidth||800, h=wave.clientHeight||85;
+  wave.width=w*devicePixelRatio; wave.height=h*devicePixelRatio;
+  wg.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+  wg.clearRect(0,0,w,h);
+  if(!buf) return;
+  const [lo,hi]=zwin(), X=t=>(t-lo)/(hi-lo)*w;
+
+  // word span backgrounds
+  gold.forEach((wd,i)=>{
+    wg.fillStyle=(i===wi)?'rgba(61,111,214,.18)'
+      : modified(i)?'rgba(78,201,138,.07)':'rgba(255,255,255,.035)';
+    wg.fillRect(X(wd.start),0,Math.max(1,X(wd.end)-X(wd.start)),h);
+  });
+
+  // waveform samples
+  const d=buf.getChannelData(0), sr=buf.sampleRate;
+  wg.fillStyle='#70b5ff';
+  for(let x=0; x<w; x++){
+    const a=lo+(x/w)*(hi-lo), b=lo+((x+1)/w)*(hi-lo);
+    const s=Math.floor((a+lead)*sr), e=Math.floor((b+lead)*sr);
+    let mn=1, mx=-1, any=false;
+    for(let i=Math.max(0,s); i<Math.min(d.length,e); i++){
+      const v=d[i]; if(v<mn) mn=v; if(v>mx) mx=v; any=true;
+    }
+    if(any) wg.fillRect(x, h/2+mn*h/2.3, 1, Math.max(1, (mx-mn)*h/2.3));
+  }
+
+  // snap points (green lines) - drawn under word marks, lighter green
+  if(snapShow&&snapPoints&&snapPoints.length){
+    wg.fillStyle='#86efac';
+    snapPoints.forEach(t=>{
+      if(t>=lo&&t<=hi) wg.fillRect(Math.round(X(t)),0,1,h);
+    });
+  }
+
+  // non-active word marks (grey) - on top of green lines
+  gold.forEach((wd,i)=>{
+    if(i===wi) return;
+    [['start',wd.start],['end',wd.end]].forEach(([which,t])=>{
+      if(X(t)<-4||X(t)>w+4) return;
+      wg.fillStyle='#4a5872';
+      wg.fillRect(Math.round(X(t)),0,1,h);
+    });
+  });
+
+  // active word marks (blue) - on top of green lines and grey marks
+  if(gold[wi]){
+    const wd=gold[wi];
+    [['start',wd.start],['end',wd.end]].forEach(([which,t])=>{
+      if(X(t)<-4||X(t)>w+4) return;
+      const on=(which===edge);
+      wg.fillStyle='#6aa0ff';
+      wg.fillRect(X(t)-(on?2:0),0,on?4:2,h);
+    });
+  }
+
+  // in-progress Ctrl+drag "create word" span
+  if(createDrag){
+    const x0=X(createDrag.s), x1=X(createDrag.e);
+    wg.fillStyle='rgba(78,201,138,.28)';
+    wg.fillRect(Math.min(x0,x1),0,Math.max(1,Math.abs(x1-x0)),h);
+    wg.strokeStyle='#4ec98a'; wg.lineWidth=1;
+    wg.strokeRect(Math.min(x0,x1)+0.5,0.5,Math.max(1,Math.abs(x1-x0))-1,h-1);
+  }
+
+  // playhead visible ONLY in top 20% of the bar
+  const p=now();
+  if(p>=lo&&p<=hi){
+    wg.fillStyle='#ff5f56';
+    wg.fillRect(X(p)-1,0,2,h*0.20);
+  }
+
+  // corner badge
+  wg.font='10px system-ui,sans-serif';
+  wg.fillStyle='rgba(255,255,255,0.4)';
+  wg.textAlign='right';
+  wg.fillText('waveform', w-8, 12);
+  wg.textAlign='left';
+}
+
+function drawZoom(){
+  const w=zm.clientWidth||800, h=zm.clientHeight||215;
+  zm.width=w*devicePixelRatio; zm.height=h*devicePixelRatio;
+  zg.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+  zg.clearRect(0,0,w,h);
+  if(!buf) return;
+  const [lo,hi]=zwin(), X=t=>(t-lo)/(hi-lo)*w;
+
+  // 1. Mel spectrogram
+  if(specCanvas){
+    const dur=buf.duration;
+    const maxF=Math.max(1,specCanvas.width-1);
+    const tStart=Math.max(-lead,lo), tEnd=Math.min(dur-lead,hi);
+    if(tEnd>tStart){
+      const sx0=((tStart+lead)/dur)*maxF;
+      const sx1=((tEnd+lead)/dur)*maxF;
+      const dx0=X(tStart);
+      const dx1=X(tEnd);
+      zg.imageSmoothingEnabled=true;
+      zg.drawImage(specCanvas,sx0,0,Math.max(0.001,sx1-sx0),specCanvas.height,
+                   dx0,0,Math.max(0.001,dx1-dx0),h);
+    }
+  }
+
+  // 2. Word span backgrounds (mid 40% of the bar) with top/bottom 1px 50% white borders
+  const yTop = h * 0.30, hSpan = h * 0.40;
+  gold.forEach((wd,i)=>{
+    const x0 = X(wd.start), wSpan = Math.max(1, X(wd.end) - x0);
+    zg.fillStyle = (i===wi)?'rgba(61,111,214,.38)'
+      : modified(i)?'rgba(78,201,138,.24)':'rgba(255,255,255,.20)';
+    zg.fillRect(x0, yTop, wSpan, hSpan);
+    zg.fillStyle = 'rgba(255,255,255,0.5)';
+    zg.fillRect(x0, yTop, wSpan, 1);
+    zg.fillRect(x0, yTop + hSpan - 1, wSpan, 1);
+  });
+
+  // 2b. In-progress Ctrl+drag "create word" span
+  if(createDrag){
+    const x0=X(createDrag.s), x1=X(createDrag.e);
+    zg.fillStyle='rgba(78,201,138,.28)';
+    zg.fillRect(Math.min(x0,x1),0,Math.max(1,Math.abs(x1-x0)),h);
+    zg.strokeStyle='#4ec98a'; zg.lineWidth=1;
+    zg.strokeRect(Math.min(x0,x1)+0.5,0.5,Math.max(1,Math.abs(x1-x0))-1,h-1);
+  }
+
+  // 2c. Aligner lanes, below your marks and above the time ticks
+  paintAlnLanes(zg,X,h*0.72,h-12,w,true);
+
+  // 3. Time ticks at bottom
+  zg.fillStyle='#2b303a';
+  for(let t=Math.ceil(lo*10)/10; t<hi; t+=0.1) zg.fillRect(X(t),h-10,1,10);
+
+  // 4. Frequency grid lines and labels on the left
+  const maxHz=(specCanvas&&specCanvas.maxHz)||5000;
+  const guideFreqs = maxHz >= 4500 ? [3000, 2000, 1000, 500] : [maxHz * 0.75, maxHz * 0.5, maxHz * 0.25];
+  zg.setLineDash([2,4]);
+  zg.strokeStyle='rgba(255,255,255,0.14)';
+  zg.lineWidth=1;
+  guideFreqs.forEach(f => {
+    const y = freqToY(f, h, maxHz);
+    zg.beginPath(); zg.moveTo(28, y); zg.lineTo(w, y); zg.stroke();
+  });
+  zg.setLineDash([]);
+
+  zg.font='9px system-ui,sans-serif';
+  zg.fillStyle='rgba(255,255,255,0.7)';
+  zg.shadowColor='rgba(0,0,0,0.85)';
+  zg.shadowBlur=3;
+  guideFreqs.forEach(f => {
+    const y = freqToY(f, h, maxHz);
+    const lbl = f >= 1000 ? (f / 1000) + 'k' : f + '';
+    zg.fillText(lbl, 3, y + 3);
+  });
+  zg.fillText((maxHz / 1000).toFixed(maxHz % 1000 ? 1 : 0) + ' kHz', 3, 10);
+  zg.fillText('0 Hz', 3, h - 3);
+
+  // 5. Snap points (green lines) - 50% high from the bottom, 50% transparent
+  if(snapShow&&snapPoints&&snapPoints.length){
+    zg.fillStyle='#86efac';
+    snapPoints.forEach(t=>{
+      if(t>=lo&&t<=hi) zg.fillRect(Math.round(X(t)),h*0.70,1,h*0.30);
+    });
+  }
+
+  // 6. Non-active word marks (grey) - overlay height (mid 40% centered)
+  gold.forEach((wd,i)=>{
+    if(i===wi) return;
+    [['start',wd.start],['end',wd.end]].forEach(([which,t])=>{
+      if(X(t)<-4||X(t)>w+4) return;
+      zg.fillStyle='#4a5872';
+      zg.fillRect(Math.round(X(t)),yTop,1,hSpan);
+    });
+  });
+
+  // 7. Active word marks (blue) - overlay height (mid 40% centered)
+  if(gold[wi]){
+    const wd=gold[wi];
+    [['start',wd.start],['end',wd.end]].forEach(([which,t])=>{
+      if(X(t)<-4||X(t)>w+4) return;
+      const on=(which===edge);
+      zg.fillStyle='#6aa0ff';
+      zg.fillRect(X(t)-(on?2:0),yTop,on?4:2,hSpan);
+    });
+  }
+
+  // 8. Word text labels - white with shadow, centered vertically and horizontally in the word segment
+  zg.shadowColor='rgba(0,0,0,0.85)';
+  zg.shadowBlur=3;
+  zg.textAlign='center';
+  zg.textBaseline='middle';
+  gold.forEach((wd,i)=>{
+    const cur=(i===wi);
+    const mid=(X(wd.start)+X(wd.end))/2;
+    if(mid>-40&&mid<w+40){
+      zg.font=(cur?'bold 13px':'normal 12px')+' system-ui';
+      zg.fillStyle='#ffffff';
+      zg.fillText(wd.word,mid,h*0.50);
+    }
+  });
+  zg.textBaseline='alphabetic';
+
+  // 9. Active edge label (START / END)
+  zg.font='bold 11px system-ui';
+  zg.fillStyle='#cfe0ff';
+  zg.fillText(edge.toUpperCase(),X(edge==='end'?gold[wi].end:gold[wi].start)
+    +(edge==='start'?6:-34),h-16);
+  zg.textAlign='left';
+  zg.shadowColor='transparent';
+  zg.shadowBlur=0;
+
+  // 8. Playhead visible ONLY in top 20% of the bar
+  const p=now();
+  if(p>=lo&&p<=hi){
+    zg.fillStyle='#ff5f56';
+    zg.fillRect(X(p)-1,0,2,h*0.20);
+  }
+
+  // Top-right readout
+  zg.textAlign='right';
+  zg.font='10px system-ui,sans-serif';
+  zg.fillStyle='rgba(255,255,255,0.55)';
+  zg.fillText('0–' + Math.round(maxHz) + ' Hz mel-spec' + (snapShow && snapPoints.length ? ' (' + snapPoints.length + ' snaps)' : ''), w - 8, 12);
+  zg.textAlign='left';
+  zg.shadowColor='transparent';
+  zg.shadowBlur=0;
+
+  $('zlab').firstChild.textContent='current word "'+gold[wi].word+'"  —  editing the '
+    +edge.toUpperCase()+'   (ticks 100 ms)   ';
+}
+function drawScroll(){
+  const lo=tmin(), hi=total(), span=hi-lo;
+  const [a,b]=zwin(), el=$('scroll'), th=$('thumb');
+  th.style.left=((a-lo)/span*100)+'%';
+  th.style.width=Math.max(2,(b-a)/span*100)+'%';
+}
+function draw(){ drawOverview(); drawWave(); drawZoom(); drawScroll(); }
+let playingIdx=-1;
+function updatePlayingChip(){
+  const p=now(); let idx=-1;
+  if(playing){ for(let i=0;i<gold.length;i++) if(p>=gold[i].start&&p<=gold[i].end){idx=i;break;} }
+  if(idx===playingIdx) return;
+  if(playingIdx>=0&&chips[playingIdx]) chips[playingIdx].classList.remove('playing');
+  playingIdx=idx;
+  if(idx>=0&&chips[idx]) chips[idx].classList.add('playing');
+}
+// The loop that moves the playhead. It used to be started only by the tagging path, so a
+// clip opened straight from the overview or the eval table never animated: the audio played
+// and the red line sat still. Guarded, so entering a clip twice does not run two loops.
+let ticking=false;
+function startTick(){ if(ticking) return; ticking=true; tick(); }
+function tick(){ if(playing)draw();
+  $('clock').textContent=mmss(now())+' / '+mmss(total()); updatePlayingChip();
+  requestAnimationFrame(tick); }
+
+// The chips are built once and then only updated. They used to be recreated on every
+// render, which silently broke double-click: the first click of the gesture calls render,
+// the node under the pointer is destroyed and replaced, and the second click lands on a
+// different element, so the browser never reports a double-click at all.
+let chips=[];
+function buildWords(){
+  const ws=$('words'); hideGapBtn(); ws.innerHTML=''; chips=[]; playingIdx=-1;
+  gold.forEach((wd,i)=>{
+    const s=document.createElement('span');
+    s.dir='auto';
+    s.title='double-click to correct the word';
+    s.onclick=()=>{wi=i;fitWord();draw();render();playWord();};
+    s.ondblclick=e=>{e.stopPropagation();editWord(i,s);};
+    ws.appendChild(s); chips.push(s);
+  });
+}
+// idx is the array position to insert BEFORE (idx===gold.length means "after the last word").
+// Delegates to the existing addWordBefore/addWord so the space-stealing/push-neighbour
+// behaviour (and the "jump straight into typing" UX) stays identical everywhere.
+function insertWordAt(idx){
+  if(!gold||!gold.length) return;
+  if(idx>=gold.length){ wi=gold.length-1; addWord(); }
+  else{ wi=Math.max(0,idx); addWordBefore(); }
+}
+
+// No space is reserved between words at rest. Instead, hovering near a chip's edge (or
+// past the first/last chip -- the sentence's own edges) injects a real "+" flex item into
+// the row right at that boundary, which pushes the neighbouring words apart to make room;
+// moving away removes it and the words settle back together. The button is anchored off
+// whichever neighbouring chip's edge is closest, so once inserted it stays stable even
+// though the OTHER chip gets pushed away by its own width.
+let gapBtn=null, gapBtnIdx=null;
+const GAP_HOVER_PX=4;
+function hideGapBtn(){
+  if(gapBtn&&gapBtn.parentNode) gapBtn.parentNode.removeChild(gapBtn);
+  gapBtn=null; gapBtnIdx=null;
+}
+function showGapBtn(idx){
+  if(gapBtnIdx===idx&&gapBtn&&gapBtn.parentNode) return;   // already showing this exact gap
+  hideGapBtn();
+  const ws=$('words');
+  const btn=document.createElement('button');
+  btn.type='button'; btn.className='wgap-add'; btn.textContent='+';
+  btn.title='insert word here'; btn.tabIndex=-1;
+  btn.onmousedown=e=>e.stopPropagation();
+  btn.onclick=e=>{ e.stopPropagation(); hideGapBtn(); insertWordAt(idx); };
+  if(idx>=chips.length) ws.appendChild(btn); else ws.insertBefore(btn,chips[idx]);
+  gapBtn=btn; gapBtnIdx=idx;
+}
+$('words').addEventListener('mousemove',e=>{
+  if(!chips.length) return;
+  let best=null;
+  chips.forEach((c,i)=>{
+    const cr=c.getBoundingClientRect();
+    if(e.clientY<cr.top-8||e.clientY>cr.bottom+8) return;   // different row
+    const dRight=Math.abs(e.clientX-cr.right);   // near this chip's right edge -> before it
+    const dLeft=Math.abs(e.clientX-cr.left);      // near this chip's left edge -> after it
+    if(dRight<=GAP_HOVER_PX&&(!best||dRight<best.d)) best={idx:i,d:dRight};
+    if(dLeft<=GAP_HOVER_PX&&(!best||dLeft<best.d)) best={idx:i+1,d:dLeft};
+  });
+  if(!best&&gapBtn){
+    // Cursor may now sit over the button itself (the neighbour it pushed away moved out
+    // of threshold range) -- keep it shown rather than flicker it away.
+    const br=gapBtn.getBoundingClientRect();
+    if(e.clientX>=br.left-4&&e.clientX<=br.right+4&&e.clientY>=br.top-4&&e.clientY<=br.bottom+4) return;
+  }
+  if(best) showGapBtn(best.idx); else hideGapBtn();
+});
+$('words').addEventListener('mouseleave',hideGapBtn);
+
+function render(){
+  if(sampleMode){
+    $('bar').innerHTML='local sample &nbsp;·&nbsp; word '+(wi+1)+'/'+gold.length;
+  }else if(isReadOnly){
+    const c=clips[ci]||{};
+    $('bar').innerHTML='clip '+(c.id||(ci+1))+' &nbsp;·&nbsp; word '+(wi+1)+'/'+gold.length
+      +' &nbsp;·&nbsp; <span style="color:#6aa0ff;font-weight:600">view only</span>';
+  }else{
+    const savedN=clips.filter(x=>x.saved).length;
+    const doneN=clips.filter(x=>x.done).length;
+    $('bar').innerHTML='clip '+(ci+1)+'/'+clips.length+' &nbsp;·&nbsp; word '+(wi+1)+'/'+gold.length
+      +' &nbsp;·&nbsp; <a id="savedLink" href="#" title="all clips assigned to you, with their status">'+savedN+' saved</a>'
+      +' &nbsp;·&nbsp; <span id="done">'+doneN+' done</span>';
+    const sl=$('savedLink'); if(sl) sl.onclick=e=>{e.preventDefault();showSaved();};
+    const un=$('unmark'); if(un) un.disabled=!(clips[ci]&&clips[ci].done);
+  }
+  if(chips.length!==gold.length || !chips.every(c=>c.parentNode)) buildWords();
+  gold.forEach((wd,i)=>{const s=chips[i];
+    s.textContent=wd.word;
+    s.className='w'+(i===wi?' cur':(modified(i)?' ok':''))
+      +((wd.was!==undefined && wd.was!==wd.word)?' fixed':'')
+      +(wd.added?' added':'');});
+  const me=gold[wi];
+  if(!me){ $('cmp').innerHTML=''; return; }
+  const prevGap=(wi>0)?me.start-gold[wi-1].end:null;
+  const p=[
+    '<span class="pill" id="lblStart" title="double-click to manually edit start" style="cursor:pointer;user-select:none"><span style="color:#8a8f98">start:</span> <b style="color:#6aa0ff">'+f3(me.start)+'</b></span>',
+    '<span class="pill" id="lblEnd" title="double-click to manually edit end" style="cursor:pointer;user-select:none"><span style="color:#8a8f98">end:</span> <b style="color:#6aa0ff">'+f3(me.end)+'</b></span>',
+    '<span class="pill"><span style="color:#8a8f98">length:</span> <b>'+Math.round((me.end-me.start)*1000)+' ms</b></span>'
+  ];
+  if(prevGap!==null){
+    if(prevGap<-0.0005){
+      p.push('<span class="pill" style="background:#5c2424;color:#ffaaaa;font-weight:bold" title="Words overlap! Click untangle words to fix">overlap before '+Math.round(-prevGap*1000)+' ms</span>');
+    }else{
+      p.push('<span class="pill">gap before '+Math.round(prevGap*1000)+' ms</span>');
+    }
+  }
+  $('cmp').innerHTML=p.join('');
+  const ls=$('lblStart'), le=$('lblEnd');
+  if(ls) ls.ondblclick=e=>{e.stopPropagation();editActiveTime('start',ls);};
+  if(le) le.ondblclick=e=>{e.stopPropagation();editActiveTime('end',le);};
+  $('edStart').classList.toggle('on',edge==='start');
+  $('edEnd').classList.toggle('on',edge==='end');
+}
+
+// The transcript is ASR output and is sometimes simply wrong -- a boundary marked around
+// the wrong word is worse than no boundary at all, because it reads as ground truth. The
+// original is kept in `was` so a corrected clip can be told apart from one that was right
+// to begin with; a benchmark cannot mix the two without saying so.
+function editWord(i,span){
+  stop();                       // the click that opened this also started playback
+  const before=gold[i].word;
+  const inp=document.createElement('input');
+  inp.className='wedit'; inp.value=before; inp.dir='auto';
+  span.replaceWith(inp); inp.focus(); inp.select();
+  const done=keep=>{
+    const v=inp.value.trim();
+    if(keep && !v){ buildWords(); render(); delWord(); return; }   // emptied = delete
+    if(keep && v && v!==before){
+      if(gold[i].was===undefined && !gold[i].added) gold[i].was=before;
+      gold[i].word=v;
+      touched.add(i);
+      save();                       // a text fix is worth keeping even if the clip is not finished
+    }
+    buildWords(); render(); draw();
+  };
+  inp.onkeydown=e=>{
+    e.stopPropagation();
+    if(e.key==='Enter'){e.preventDefault();done(true);}
+    if(e.key==='Escape'){e.preventDefault();done(false);}
+  };
+  inp.onblur=()=>done(true);
+}
+
+let editingTime=false;
+function editActiveTime(which,el){
+  if(editingTime||!gold||!gold[wi]) return;
+  stop();
+  editingTime=true;
+  const isStart=(which==='start');
+  const val=isStart?gold[wi].start:gold[wi].end;
+  const inp=document.createElement('input');
+  inp.type='text';
+  inp.value=f3(val);
+  inp.className='wedit';
+  inp.style.minWidth='75px';
+  inp.style.width='75px';
+  inp.style.direction='ltr';
+  inp.style.textAlign='center';
+  inp.style.color='#6aa0ff';
+  inp.style.fontWeight='bold';
+  el.replaceWith(inp);
+  inp.focus();
+  inp.select();
+
+  let finished=false;
+  const finish=commit=>{
+    if(finished) return;
+    finished=true;
+    editingTime=false;
+    if(commit){
+      const parsed=parseFloat(inp.value.trim());
+      if(!isNaN(parsed)&&isFinite(parsed)){
+        if(isStart){
+          gold[wi].start=parsed;
+          if(gold[wi].end<parsed) gold[wi].end=parsed;
+        }else{
+          gold[wi].end=parsed;
+          if(gold[wi].start>parsed) gold[wi].start=parsed;
+        }
+        touched.add(wi);
+        save();
+      }
+    }
+    render(); draw();
+  };
+
+  inp.onkeydown=e=>{
+    e.stopPropagation();
+    if(e.key==='Enter'){e.preventDefault();finish(true);}
+    if(e.key==='Escape'){e.preventDefault();finish(false);}
+  };
+  inp.onblur=()=>finish(true);
+}
+
+// In-place text edit triggered by double-clicking a word's label inside the "current word"
+// visualization bar (the mid-height highlight band), rather than the chip in the preview
+// row above. Mirrors editWord()'s save/was/delete-on-empty behaviour, but floats a plain
+// <input> over the canvas at the word's on-screen position instead of swapping a DOM span.
+let barEditing=false;
+function editBarWord(idx){
+  if(barEditing||!gold||!gold[idx]) return;
+  stop();
+  barEditing=true;
+  const before=gold[idx].word;
+  const r=zm.getBoundingClientRect();
+  const [lo,hi]=zwin();
+  const X=t=>(t-lo)/(hi-lo)*r.width;
+  const wd=gold[idx];
+  const midX=r.left+(X(wd.start)+X(wd.end))/2;
+  const midY=r.top+r.height*0.50;
+  const inp=document.createElement('input');
+  inp.className='wedit'; inp.value=before; inp.dir='auto';
+  inp.style.position='fixed'; inp.style.left=midX+'px'; inp.style.top=midY+'px';
+  inp.style.transform='translate(-50%,-50%)'; inp.style.textAlign='center'; inp.style.zIndex=100;
+  document.body.appendChild(inp);
+  inp.focus(); inp.select();
+  const done=keep=>{
+    if(!barEditing) return;              // already finished (e.g. resize cancelled it)
+    barEditing=false; inp.remove();
+    const v=inp.value.trim();
+    if(keep && !v){ delWord(idx); return; }         // emptied = delete
+    if(keep && v && v!==before){
+      if(gold[idx].was===undefined && !gold[idx].added) gold[idx].was=before;
+      gold[idx].word=v;
+      touched.add(idx);
+      save();
+    }
+    buildWords(); render(); draw();
+  };
+  inp.onkeydown=e=>{
+    e.stopPropagation();
+    if(e.key==='Enter'){e.preventDefault();done(true);}
+    if(e.key==='Escape'){e.preventDefault();done(false);}
+  };
+  inp.onblur=()=>done(true);
+  const cancelOnResize=()=>done(false);
+  addEventListener('resize',cancelOnResize,{once:true});
+}
+
+// `touched` is a set of positions, so inserting or removing a word renumbers every entry
+// after it. Left unshifted, the green "done" marks would silently slide onto the wrong
+// words.
+function shiftTouched(set,at,by){
+  const out=new Set();
+  set.forEach(i=>{
+    if(i<at) out.add(i);
+    else if(by>0) out.add(i+by);
+    else if(i>at) out.add(i-1);
+  });
+  return out;
+}
+
+// A word the ASR missed entirely. Added after the currently selected word.
+async function addWord(){
+  if(!gold||!gold.length) return;
+  const MIN_LEN=0.020;    // 20ms minimal word length
+  const TARGET_LEN=0.500; // 500ms target length if space permits
+  const maxAudio=total();
+
+  const cur=gold[wi];
+  const next=(wi+1<gold.length)?gold[wi+1]:null;
+  const newStart=cur.end;
+
+  let space=next?(next.start-newStart):(maxAudio-newStart);
+  let newEnd;
+  let pushed=false;
+
+  if(next){
+    if(space>=TARGET_LEN){
+      newEnd=newStart+TARGET_LEN;
+    }else if(space>=MIN_LEN){
+      newEnd=next.start;
+    }else{
+      newEnd=newStart+MIN_LEN;
+      next.start=newEnd;
+      pushed=true;
+    }
+  }else{
+    newEnd=Math.min(newStart+TARGET_LEN,maxAudio);
+  }
+
+  if(newStart>maxAudio) newStart=maxAudio;
+  if(newEnd>maxAudio) newEnd=maxAudio;
+  if(newEnd<newStart) newEnd=newStart;
+
+  const newWord={word:'?',start:newStart,end:newEnd,added:true};
+  const insertIndex=wi+1;
+  gold.splice(insertIndex,0,newWord);
+  touched=shiftTouched(touched,insertIndex,1);
+  touched.add(insertIndex);
+
+  if(pushed){
+    for(let k=insertIndex+1;k<gold.length;k++){
+      if(gold[k].start>maxAudio) gold[k].start=maxAudio;
+      if(gold[k].end-gold[k].start<MIN_LEN){
+        gold[k].end=gold[k].start+MIN_LEN;
+      }
+      if(gold[k].end>maxAudio) gold[k].end=maxAudio;
+
+      touched.add(k);
+
+      if(k<gold.length-1){
+        if(gold[k+1].start<gold[k].end){
+          gold[k+1].start=gold[k].end;
+        }else{
+          break;
+        }
+      }
+    }
+  }
+
+  wi=insertIndex;
+  fitWord();
+  buildWords();
+  render();
+  draw();
+  // Await the save before opening the editor: save()'s completion calls render(), and
+  // render() rebuilds every chip from scratch whenever one is detached (which the editor's
+  // input-for-span swap does). Editing before that render lands means the rebuild replaces
+  // the freshly-focused input with a plain span out from under the user's cursor.
+  await save();
+  editWord(wi,chips[wi]);        // straight into typing; a word called "?" helps nobody
+}
+
+// Same as addWord, mirrored backwards: inserted before the currently selected word,
+// stealing space from whatever precedes it instead of whatever follows it.
+async function addWordBefore(){
+  if(!gold||!gold.length) return;
+  const MIN_LEN=0.020;    // 20ms minimal word length
+  const TARGET_LEN=0.500; // 500ms target length if space permits
+  const minAudio=tmin();
+
+  const cur=gold[wi];
+  const prev=(wi-1>=0)?gold[wi-1]:null;
+  const newEnd=cur.start;
+
+  let space=prev?(newEnd-prev.end):(newEnd-minAudio);
+  let newStart;
+  let pushed=false;
+
+  if(prev){
+    if(space>=TARGET_LEN){
+      newStart=newEnd-TARGET_LEN;
+    }else if(space>=MIN_LEN){
+      newStart=prev.end;
+    }else{
+      newStart=newEnd-MIN_LEN;
+      prev.end=newStart;
+      pushed=true;
+    }
+  }else{
+    newStart=Math.max(newEnd-TARGET_LEN,minAudio);
+  }
+
+  if(newStart<minAudio) newStart=minAudio;
+  if(newStart>newEnd) newStart=newEnd;
+
+  const newWord={word:'?',start:newStart,end:newEnd,added:true};
+  const insertIndex=wi;
+  gold.splice(insertIndex,0,newWord);
+  touched=shiftTouched(touched,insertIndex,1);
+  touched.add(insertIndex);
+
+  if(pushed){
+    for(let k=insertIndex-1;k>=0;k--){
+      if(gold[k].start<minAudio) gold[k].start=minAudio;
+      if(gold[k].end-gold[k].start<MIN_LEN){
+        gold[k].start=gold[k].end-MIN_LEN;
+      }
+      if(gold[k].start<minAudio) gold[k].start=minAudio;
+
+      touched.add(k);
+
+      if(k>0){
+        if(gold[k-1].end>gold[k].start){
+          gold[k-1].end=gold[k].start;
+        }else{
+          break;
+        }
+      }
+    }
+  }
+
+  wi=insertIndex;
+  fitWord();
+  buildWords();
+  render();
+  draw();
+  // Await the save before opening the editor: save()'s completion calls render(), and
+  // render() rebuilds every chip from scratch whenever one is detached (which the editor's
+  // input-for-span swap does). Editing before that render lands means the rebuild replaces
+  // the freshly-focused input with a plain span out from under the user's cursor.
+  await save();
+  editWord(wi,chips[wi]);        // straight into typing; a word called "?" helps nobody
+}
+
+// Ctrl+drag over a stretch of the bar with no existing word creates one spanning exactly
+// the dragged range. Insertion position is derived from the times themselves (not from
+// `wi`), since the drag can happen anywhere -- including before the first or after the
+// last word.
+async function createWordAt(s,e){
+  if(!(e>s)) return;
+  let idx=gold.findIndex(wd=>wd.start>=e-1e-9);
+  if(idx<0) idx=gold.length;
+  gold.splice(idx,0,{word:'?',start:s,end:e,added:true});
+  touched=shiftTouched(touched,idx,1); touched.add(idx);
+  wi=idx; edge='end';
+  fitWord(); buildWords(); render(); draw();
+  await save();
+  editBarWord(wi);        // straight into typing, same as the +before/+after buttons
+}
+
+function untangleWords(){
+  if(!gold||gold.length<=1) return;
+  if(!confirm("Untangle words will change any overlapping word timings regardless of original values. Continue?")) return;
+
+  const MIN_LEN = 0.020;  // 20ms minimal word length
+  const EPS = 1e-4;
+  const minAudio = (typeof tmin === 'function') ? tmin() : 0;
+  const maxAudio = (typeof total === 'function' && total() > minAudio) ? total() : Infinity;
+
+  let changed = false;
+
+  // 1. Sanitize every word: ensure valid numeric values, end > start, and min duration
+  for (let i = 0; i < gold.length; i++) {
+    let s = Number(gold[i].start);
+    let e = Number(gold[i].end);
+    if (isNaN(s) || !isFinite(s)) s = minAudio;
+    if (isNaN(e) || !isFinite(e)) e = s + MIN_LEN;
+    if (e < s) { const tmp = s; s = e; e = tmp; changed = true; }
+    if (e - s < MIN_LEN) { e = s + MIN_LEN; changed = true; }
+    if (gold[i].start !== s || gold[i].end !== e) changed = true;
+    gold[i].start = s;
+    gold[i].end = e;
+  }
+
+  // 2. Cluster overlapping and out-of-order words along sentence order
+  const groups = gold.map(w => ({
+    words: [w],
+    start: w.start,
+    end: Math.max(w.end, w.start + MIN_LEN)
+  }));
+
+  const merged = [];
+  for (const g of groups) {
+    let cur = g;
+    while (merged.length > 0) {
+      const prev = merged[merged.length - 1];
+      if (cur.start < prev.end - EPS) {
+        merged.pop();
+        const totalWords = prev.words.length + cur.words.length;
+        const minS = Math.min(prev.start, cur.start);
+        const maxE = Math.max(prev.end, cur.end, minS + totalWords * MIN_LEN);
+        cur = {
+          words: prev.words.concat(cur.words),
+          start: minS,
+          end: maxE
+        };
+      } else {
+        break;
+      }
+    }
+    merged.push(cur);
+  }
+
+  // 3. Shift backwards from audio ceiling if needed, merging backwards if pushed into previous group
+  if (isFinite(maxAudio)) {
+    for (let i = merged.length - 1; i >= 0; i--) {
+      const g = merged[i];
+      if (g.end > maxAudio) {
+        const diff = g.end - maxAudio;
+        g.end = maxAudio;
+        g.start = Math.max(minAudio, g.start - diff);
+        if (i > 0 && g.start < merged[i - 1].end - EPS) {
+          const prev = merged[i - 1];
+          merged.splice(i - 1, 2, {
+            words: prev.words.concat(g.words),
+            start: Math.min(prev.start, g.start),
+            end: Math.max(prev.end, g.end)
+          });
+          i = merged.length;
+        }
+      }
+    }
+  }
+
+  // 4. Untangle each multi-word group: split shared space equally among words in sentence order
+  for (const g of merged) {
+    if (g.words.length > 1) {
+      changed = true;
+      const span = Math.max(g.words.length * MIN_LEN, g.end - g.start);
+      const step = span / g.words.length;
+      for (let k = 0; k < g.words.length; k++) {
+        g.words[k].start = g.start + k * step;
+        g.words[k].end = (k === g.words.length - 1) ? g.end : (g.start + (k + 1) * step);
+      }
+    }
+  }
+
+  if (changed) {
+    gold.forEach((_, i) => touched.add(i));
+    save();
+  }
+
+  buildWords();
+  render();
+  draw();
+}
+
+function resetToBaseline(){
+  const base=sampleMode?sampleBaseline:(clips[ci]&&clips[ci].words);
+  if(!base||!base.length) return;
+  if(!confirm("Reset all words to dataset baseline? This will restore original words and timings.")) return;
+  stop();
+  gold=base.map(w=>({word:w.word,start:w.start,end:w.end}));
+  touched=new Set();
+  wi=0;
+  edge='end';
+  fitWord();
+  buildWords();
+  render();
+  draw();
+  save();
+}
+
+// ---- call-out to the aligner service --------------------------------------
+//
+// Unlike untangle/reset-baseline (instant, local, free), this is a real network call to a
+// GPU worker that can take minutes on a cold start (api-client-guide.md §4), so it gets its
+// own spinner, its own cancel path, and disables the other clip-mutating actions while it
+// is in flight -- navigating away mid-align would apply the result to the wrong clip, or
+// leave a job running nobody is watching.
+let alignJobId=null, alignPollTimer=null, alignForKey=null;
+
+function setAlignBusy(busy){
+  ['saveonly','save','unmark','prevc','skip','resetBaselineBtn','untangleBtn'].forEach(id=>{
+    const el=$(id); if(el) el.disabled=busy;
+  });
+}
+
+async function startAlign(){
+  if(sampleMode||isReadOnly||alignJobId) return;
+  const c=clips[ci];
+  const key=c ? (c.key||c.id) : '';
+  // Align using the words (text) from the USER marking, not the baseline
+  const userWords = gold.map(w => (w.word||'').trim()).filter(Boolean);
+  if(!userWords.length){
+    finishAlignUI('No words to align');
+    return 'No words to align';
+  }
+  setAlignBusy(true);
+  $('alignBtn').textContent='cancel align';
+  $('alignBtn').classList.add('on');
+  $('alignStatus').innerHTML='<span class="spinner"></span>calling the aligner service'
+    +' (can take a couple of minutes on a cold start)&hellip;';
+  try{
+    const r=await fetch(api('/api/align'),{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key, words:userWords, text:userWords.join(' ')})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok || j.error){
+      const err = j.error || ('HTTP '+r.status);
+      finishAlignUI(err);
+      return err;
+    }
+    alignJobId=j.job_id; alignForKey=key;
+    pollAlign();
+  }catch(err){
+    const msg = ''+err;
+    finishAlignUI(msg);
+    return msg;
+  }
+}
+
+function pollAlign(){
+  alignPollTimer=setTimeout(async ()=>{
+    if(!alignJobId) return;
+    try{
+      const r=await fetch(api('/api/align-status?job='+encodeURIComponent(alignJobId)));
+      const j=await r.json().catch(()=>({}));
+      if(!r.ok || j.error){
+        const err = j.error || ('HTTP '+r.status);
+        finishAlignUI(err);
+        return err;
+      }
+      if(j.status==='running'){ pollAlign(); return; }
+      if(j.status==='done'){ applyAlignResult(j.words); finishAlignUI('Align complete \u2014 replaced your marks.'); }
+      else if(j.status==='cancelled'){ finishAlignUI('Align cancelled.'); }
+      else{ finishAlignUI(j.error || 'Align failed'); }
+    }catch(err){
+      finishAlignUI('Align failed: '+err);
+    }
+  },1200);
+}
+
+function applyAlignResult(words){
+  if(!words||!words.length) return;
+  const c=clips[ci];
+  // The annotator may have navigated to a different clip while this was in flight (nav is
+  // disabled via setAlignBusy, but "back to tagging"/"overview" are not) -- in that case the
+  // result belongs to a clip that is no longer on screen, so drop it rather than overwrite
+  // whatever is showing now.
+  if(!c || (c.key||c.id)!==alignForKey || sampleMode || isReadOnly) return;
+  stop();
+  gold=words.map((w, i)=>({
+    word: w.word,
+    start: w.start,
+    end: w.end,
+    ...(gold[i] && gold[i].was !== undefined ? {was: gold[i].was} : {}),
+    ...(gold[i] && gold[i].added ? {added: true} : {})
+  }));
+  touched=new Set(gold.map((_,i)=>i));
+  wi=0; edge='end';
+  fitWord();
+  buildWords();
+  render();
+  draw();
+  clips[ci].saved=gold.map(w=>({...w}));
+  save();
+}
+
+async function cancelAlign(){
+  if(!alignJobId) return;
+  const jobId=alignJobId;
+  if(alignPollTimer){ clearTimeout(alignPollTimer); alignPollTimer=null; }
+  alignJobId=null; alignForKey=null;
+  $('alignStatus').innerHTML='<span class="spinner"></span>cancelling\u2026';
+  try{
+    // Best effort either way -- the server marks the job cancelled and, on our side,
+    // shuts the socket to the aligner out from under whichever call is still blocked on
+    // it. Once this resolves (or fails) the annotator's current marks are untouched.
+    await fetch(api('/api/align-cancel'),{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({job_id:jobId})});
+  }catch(err){ /* the job is treated as cancelled client-side regardless */ }
+  finishAlignUI('Align cancelled.');
+}
+
+function finishAlignUI(msg){
+  if(alignPollTimer){ clearTimeout(alignPollTimer); alignPollTimer=null; }
+  alignJobId=null; alignForKey=null;
+  setAlignBusy(false);
+  const btn=$('alignBtn');
+  btn.textContent='align'; btn.classList.remove('on');
+  btn.value = msg || '';
+  btn.dataset.status = msg || '';
+  if(msg==='Aligner disabled') btn.title='Aligner disabled';
+  $('alignStatus').textContent=msg||'';
+  if(msg) setTimeout(()=>{ if($('alignStatus').textContent===msg) $('alignStatus').textContent=''; },5000);
+  if(!sampleMode&&!isReadOnly) render();  // re-sync button states (e.g. "unmark") after the forced-enable above
+}
+
+$('alignBtn').onclick=()=>{ return alignJobId?cancelAlign():startAlign(); };
+window.align = startAlign;
+
+// A word the ASR invented. The clip keeps its original `transcript`, so a word missing from
+// `words` is still recoverable downstream -- deletion needs no flag of its own.
+function delWord(idx){
+  if(gold.length<=1) return;
+  idx=(idx===undefined)?wi:idx;
+  gold.splice(idx,1);
+  touched=shiftTouched(touched,idx,-1);
+  if(wi>idx) wi--;
+  wi=Math.min(wi,gold.length-1);
+  buildWords(); render(); draw(); save();
+}
+
+// Marks stay ordered, but only against their immediate neighbours -- clamping a word's end
+// against the NEXT word's end would silently refuse "take aligner B" whenever B places this
+// word later than A placed the following one, which is exactly the disagreement being judged.
+// A real gap between two words is silence and is left alone: pushing a mark into it just
+// stops at the neighbour's mark, same as before. But when two marks are already flush (no
+// gap -- the split between the words is what's misplaced, not any silence), pushing one PAST
+// its neighbour carries the neighbour's mark along too, and the chain continues into further
+// flush words. Without this, closing a wrongly-placed split meant shoving the far mark all the
+// way over to touch its neighbour first, then dragging both back the other way -- pure
+// friction for what is really just "this one boundary is in the wrong place."
+const ADJ_EPS=0.001;                  // "touching, no gap" tolerance, in seconds
+
+// Move word idx's END toward t, carrying the next word's START along when they're flush.
+function pushEnd(idx,t){
+  t=Math.max(t,gold[idx].start+.005);
+  if(idx<gold.length-1){
+    const nextStart=gold[idx+1].start;
+    if(t>nextStart+1e-9){
+      if(Math.abs(gold[idx].end-nextStart)<ADJ_EPS){ pushStart(idx+1,t); t=Math.min(t,gold[idx+1].start); }
+      else t=nextStart;
+    }
+  }else t=Math.min(t,total());
+  gold[idx].end=t; touched.add(idx);
+}
+// Move word idx's START toward t, carrying the previous word's END along when they're flush.
+function pushStart(idx,t){
+  t=Math.min(t,gold[idx].end-.005);
+  if(idx>0){
+    const prevEnd=gold[idx-1].end;
+    if(t<prevEnd-1e-9){
+      if(Math.abs(gold[idx].start-prevEnd)<ADJ_EPS){ pushEnd(idx-1,t); t=Math.max(t,gold[idx-1].end); }
+      else t=prevEnd;
+    }
+  }else t=Math.max(t,tmin());
+  gold[idx].start=t; touched.add(idx);
+}
+// Dragging a whole word (both marks together, length fixed) is the same "push, don't clamp"
+// idea as pushEnd/pushStart, just simpler: since the dragged word's length never changes,
+// contact with a neighbour is just end>start (no flush check needed -- a real gap is consumed
+// first, and only once the edge actually reaches the neighbour does it start moving). The
+// cascade cannot run out of neighbours to push forever, so after cascading the whole chain
+// is pulled back inside [tmin(),total()] as one block if it ran past either edge -- that
+// includes the word being dragged, which is how the drag itself ends up clamped at the ends
+// of the clip instead of at the first neighbour it touches.
+function pushWord(idx){
+  for(let i=idx;i<gold.length-1;i++){
+    const delta=gold[i].end-gold[i+1].start;
+    if(delta<=1e-9) break;
+    gold[i+1].start+=delta; gold[i+1].end+=delta; touched.add(i+1);
+  }
+  for(let i=idx;i>0;i--){
+    const delta=gold[i-1].end-gold[i].start;
+    if(delta<=1e-9) break;
+    gold[i-1].start-=delta; gold[i-1].end-=delta; touched.add(i-1);
+  }
+  const over=gold[gold.length-1].end-total();
+  if(over>0) for(let i=idx;i<gold.length;i++){ gold[i].start-=over; gold[i].end-=over; }
+  const under=tmin()-gold[0].start;
+  if(under>0) for(let i=0;i<=idx;i++){ gold[i].start+=under; gold[i].end+=under; }
+}
+function setMark(t,which){
+  which=which||edge;
+  if(which==='start') pushStart(wi,t); else pushEnd(wi,t);
+  touched.add(wi); ensureVisible(which==='start'?gold[wi].start:gold[wi].end);
+  draw(); render();
+  if(loopKind){ const sp=loopSpan(); start(sp[0],sp[1]); }
+  else scheduleWordPlay();
+}
+const goWord=i=>{ const old=wi; wi=Math.max(0,Math.min(i,gold.length-1));
+  if(wi>old) edge='start'; else if(wi<old) edge='end';
+  fitWord(); draw(); render();
+  if(loopKind){const sp=loopSpan(); start(sp[0],sp[1]);}
+  else playWord();
+};
+const stepMark=dir=>{
+  if(dir>0){
+    if(edge==='start') edge='end';
+    else if(wi<gold.length-1){wi++;edge='start';}
+  }else{
+    if(edge==='end') edge='start';
+    else if(wi>0){wi--;edge='end';}
+  }
+  fitWord(); draw(); render();
+  if(loopKind){const sp=loopSpan(); start(sp[0],sp[1]);}
+  else playWord();
+};
+
+// ---- pointer -------------------------------------------------------------
+ov.onmousedown=e=>{
+  const r=ov.getBoundingClientRect();
+  const at=x=>(x-r.left)/r.width*buf.duration-lead;
+  moveHead(at(e.clientX));
+  const mv=ev=>moveHead(at(ev.clientX));          // drag to scrub
+  const up=()=>{removeEventListener('mousemove',mv);removeEventListener('mouseup',up);};
+  addEventListener('mousemove',mv); addEventListener('mouseup',up);
+};
+function attachZoomEvents(canvas){
+  canvas.onmousedown=e=>{
+    const r=canvas.getBoundingClientRect();
+    const at=x=>{const [lo,hi]=zwin(); return lo+((x-r.left)/r.width)*(hi-lo);};
+    const px=t=>{const [lo,hi]=zwin(); return (t-lo)/(hi-lo)*r.width+r.left;};
+
+    // Ctrl/Cmd+drag over a stretch with no existing word draws out a brand new one. The
+    // drag is clamped to the surrounding silence so it can never eat into a neighbour.
+    if((e.ctrlKey||e.metaKey)&&buf){
+      const t0=at(e.clientX);
+      const overlapsWord=gold.some(wd=>t0>wd.start-1e-6&&t0<wd.end+1e-6);
+      if(!overlapsWord){
+        e.preventDefault();
+        let glo=tmin(), ghi=total();
+        gold.forEach(wd=>{
+          if(wd.end<=t0+1e-9&&wd.end>glo) glo=wd.end;
+          if(wd.start>=t0-1e-9&&wd.start<ghi) ghi=wd.start;
+        });
+        let a=t0,b=t0;
+        createDrag={s:a,e:b}; draw();
+        canvas.classList.add('grabbing');
+        const mv=ev=>{
+          b=Math.max(glo,Math.min(at(ev.clientX),ghi));
+          createDrag={s:Math.min(a,b),e:Math.max(a,b)};
+          draw();
+        };
+        const up=()=>{
+          canvas.classList.remove('grabbing');
+          removeEventListener('mousemove',mv); removeEventListener('mouseup',up);
+          const MIN_LEN=0.02;
+          let s=createDrag.s, en=createDrag.e;
+          createDrag=null;
+          if(en-s<MIN_LEN){ en=Math.min(ghi,s+MIN_LEN); if(en-s<MIN_LEN) s=Math.max(glo,en-MIN_LEN); }
+          if(en-s<0.005){ draw(); return; }
+          createWordAt(s,en);
+        };
+        addEventListener('mousemove',mv); addEventListener('mouseup',up);
+        return;
+      }
+    }
+
+    // Playhead is grabbable ONLY in top 20% of the bar; remaining 80% left for interactions
+    const inPlayheadZone=e.clientY<=r.top+r.height*0.20;
+    if(Math.abs(px(now())-e.clientX)<9 && inPlayheadZone){
+      canvas.classList.add('grabbing');
+      const mv=ev=>moveHead(at(ev.clientX));
+      const up=()=>{canvas.classList.remove('grabbing');
+        removeEventListener('mousemove',mv);removeEventListener('mouseup',up);};
+      addEventListener('mousemove',mv); addEventListener('mouseup',up); return;
+    }
+    const inOverlayZone = (canvas !== zm) || (e.clientY >= r.top + r.height * 0.30 && e.clientY <= r.top + r.height * 0.70);
+    if(inOverlayZone){
+      // nearest mark across ALL words, so any of them can be grabbed without switching first.
+      // When two marks land on (essentially) the same pixel -- words flush with no gap between
+      // them -- always prefer the already-selected word's own marker over its neighbour's: the
+      // user selected that word to work on it, and iteration order over `gold` shouldn't
+      // silently hand the drag to whichever neighbour happens to be touching it instead.
+      const TIE_PX=1;                     // marks within this many px count as "same place"
+      let best=null;
+      gold.forEach((wd,i)=>{
+        [['start',wd.start],['end',wd.end]].forEach(([which,t])=>{
+          const d=Math.abs(px(t)-e.clientX);
+          const tie=best&&Math.abs(d-best.d)<=TIE_PX;
+          if(!best||d<best.d-TIE_PX||(tie&&i===wi&&best.i!==wi)) best={d,i,which};
+        });
+      });
+      // inside a word, away from its marks: drag the whole word, both marks together
+      if(!(best&&best.d<9)){
+        const t=at(e.clientX);
+        const inside=gold.findIndex(wd=>t>wd.start&&t<wd.end);
+        if(inside>=0){
+          wi=inside; render();
+          const w=gold[wi], len=w.end-w.start, grab=t-w.start, downX=e.clientX;
+          let moved=false;
+          const mv=ev=>{
+            if(!moved){ if(Math.abs(ev.clientX-downX)<=3) return;
+              moved=true; dragging=true; canvas.classList.add('grabbing'); }
+            let a=at(ev.clientX)-grab;
+            a=Math.max(tmin(),Math.min(a,total()-len));
+            w.start=a; w.end=a+len; touched.add(wi);
+            pushWord(wi);
+            draw(); render();
+            if(loopKind){const sp=loopSpan(); start(sp[0],sp[1]);}
+            else scheduleWordPlay();
+          };
+          const up=()=>{ if(!moved) moveHead(t);
+            dragging=false; canvas.classList.remove('grabbing');
+            removeEventListener('mousemove',mv); removeEventListener('mouseup',up);};
+          addEventListener('mousemove',mv); addEventListener('mouseup',up); return;
+        }
+      }
+      if(best&&best.d<9){                          // grabbed a mark: drag it (mouse never snaps)
+        wi=best.i; const which=best.which; edge=which; dragging=true; render();
+        canvas.classList.add('grabbing');
+        let last=e.clientX;
+        setMark(at(e.clientX),which);
+        const mv=ev=>{ last=ev.clientX; setMark(at(ev.clientX),which); };
+        const timer=setInterval(()=>{
+          const [lo,hi]=zwin(), span=hi-lo;
+          if(last<r.left+6){ panBy(-span*0.05); setMark(mark()-span*0.05,which); }
+          else if(last>r.right-6){ panBy(span*0.05); setMark(mark()+span*0.05,which); }
+        },50);
+        const up=()=>{clearInterval(timer); dragging=false; canvas.classList.remove('grabbing');
+          removeEventListener('mousemove',mv);removeEventListener('mouseup',up);};
+        addEventListener('mousemove',mv); addEventListener('mouseup',up); return;
+      }
+    }
+    // Outside word overlays or marks: drag to pan/scroll the view, or click without dragging to move the playhead.
+    const t0x=e.clientX, tAtDown=at(e.clientX); let moved=false;
+    let prev=t0x;
+    const mv2=ev=>{
+      if(Math.abs(ev.clientX-t0x)>3){ moved=true; dragging=true; }
+      if(!moved){prev=ev.clientX; return;}
+      const [lo,hi]=zwin();
+      panBy(-(ev.clientX-prev)/r.width*(hi-lo));
+      prev=ev.clientX;
+    };
+    canvas.classList.add('grabbing');
+    const up=()=>{ canvas.classList.remove('grabbing'); dragging=false; if(!moved) moveHead(tAtDown);
+      removeEventListener('mousemove',mv2); removeEventListener('mouseup',up); };
+    addEventListener('mousemove',mv2); addEventListener('mouseup',up);
+  };
+  canvas.addEventListener('mousemove',e=>{
+    if(!buf||canvas.classList.contains('grabbing'))return;
+    const r=canvas.getBoundingClientRect(),[lo,hi]=zwin();
+    const px=t=>(t-lo)/(hi-lo)*r.width+r.left;
+    let near=(e.clientY<=r.top+r.height*0.20)?Math.abs(px(now())-e.clientX):999;
+    const inOverlay=(canvas!==zm)||(e.clientY>=r.top+r.height*0.30&&e.clientY<=r.top+r.height*0.70);
+    if(inOverlay){
+      gold.forEach(wd=>{ near=Math.min(near,Math.abs(px(wd.start)-e.clientX),Math.abs(px(wd.end)-e.clientX)); });
+    }
+    canvas.classList.toggle('onmark',near<9);
+  });
+  canvas.addEventListener('wheel',e=>{
+    e.preventDefault();
+    const r=canvas.getBoundingClientRect(), [lo,hi]=zwin();
+    const t=lo+((e.clientX-r.left)/r.width)*(hi-lo);
+    if(e.shiftKey) panBy((e.deltaY!==0?e.deltaY:e.deltaX)/500*(hi-lo));
+    else zoomAt(t, e.deltaY>0?1.25:0.8);
+  },{passive:false});
+}
+attachZoomEvents(zm);
+attachZoomEvents(wave);
+
+// Double-click a word's label in the "current word" bar's highlight band (the mid 40%
+// overlay where word spans and their text are drawn) to edit that word's text in place.
+zm.addEventListener('dblclick',e=>{
+  if(!buf) return;
+  const r=zm.getBoundingClientRect();
+  if(e.clientY<r.top+r.height*0.30||e.clientY>r.top+r.height*0.70) return;
+  const [lo,hi]=zwin();
+  const t=lo+((e.clientX-r.left)/r.width)*(hi-lo);
+  const idx=gold.findIndex(wd=>t>=wd.start&&t<=wd.end);
+  if(idx<0) return;
+  e.preventDefault();
+  editBarWord(idx);
+});
+
+(function(){
+  const el=$('scroll'), th=$('thumb');
+  const spanNow=()=>{const [a,b]=zwin(); return b-a;};
+  function centreOn(clientX){
+    const r=el.getBoundingClientRect(), lo=tmin(), hi=total();
+    const t=lo+((clientX-r.left)/r.width)*(hi-lo), s=spanNow();
+    let a=t-s/2, b=a+s;
+    if(a<lo){a=lo;b=a+s;} if(b>hi){b=hi;a=Math.max(lo,b-s);}
+    view=[a,b]; draw();
+  }
+  th.onmousedown=e=>{
+    e.stopPropagation();
+    const r=el.getBoundingClientRect(), lo=tmin(), hi=total();
+    const grab=e.clientX-th.getBoundingClientRect().left, s=spanNow();
+    const mv=ev=>{
+      let a=lo+((ev.clientX-grab-r.left)/r.width)*(hi-lo), b=a+s;
+      if(a<lo){a=lo;b=a+s;} if(b>hi){b=hi;a=Math.max(lo,b-s);}
+      view=[a,b]; draw();
+    };
+    const up=()=>{removeEventListener('mousemove',mv);removeEventListener('mouseup',up);};
+    addEventListener('mousemove',mv); addEventListener('mouseup',up);
+  };
+  el.onmousedown=e=>{ if(e.target===th)return; centreOn(e.clientX); };
+})();
+$('play').onclick=toggle;
+$('stopb').onclick=()=>{loopKind=null;$('loopWord').classList.remove('on');$('loopMark').classList.remove('on');stop();head=0;seg=null;draw();};
+$('tostart').onclick=()=>moveHead(0);
+$('pbefore').onclick=playBefore; $('pword').onclick=playWord; $('pafter').onclick=playAfter;
+$('loopWord').onclick=()=>setLoop('word');
+$('loopMark').onclick=()=>setLoop('mark');
+$('rate').onchange=e=>{
+  const was=playing, at=now(), span=seg;
+  rate=parseFloat(e.target.value);
+  // Build it now. Stretching a clip takes about as long as playing a word, and paying that
+  // on the first press of play reads as the transport being broken.
+  if(buf) stretched(rate);
+  if(was) start(at, span?span[1]:null);
+};
+$('edStart').onclick=()=>{edge='start';draw();render();};
+$('edEnd').onclick=()=>{edge='end';draw();render();};
+$('edStart').ondblclick=e=>{e.stopPropagation();const ls=$('lblStart');if(ls)editActiveTime('start',ls);};
+$('edEnd').ondblclick=e=>{e.stopPropagation();const le=$('lblEnd');if(le)editActiveTime('end',le);};
+$('playMark').checked=localStorage.getItem('tagPlayMark')!=='0';
+playOnMark=$('playMark').checked;
+$('playMark').onchange=e=>{playOnMark=e.target.checked;
+  localStorage.setItem('tagPlayMark',playOnMark?'1':'0');};
+function updateSnapVisibility(){
+  if($('snapControls')) $('snapControls').style.display = snapShow ? 'inline-flex' : 'none';
+  if($('snapLegendKey')) $('snapLegendKey').style.display = snapShow ? 'inline-block' : 'none';
+  if($('snapOvLegendKey')) $('snapOvLegendKey').style.display = snapShow ? 'inline-block' : 'none';
+}
+if($('snapThresh')){
+  $('snapThresh').value=snapThreshRatio;
+  $('snapThreshVal').textContent=snapThreshRatio.toFixed(2);
+  $('snapThresh').oninput=e=>{
+    snapThreshRatio=parseFloat(e.target.value);
+    $('snapThreshVal').textContent=snapThreshRatio.toFixed(2);
+    localStorage.setItem('tagSnapThresh',snapThreshRatio);
+    refreshSnapPoints(true);
+  };
+}
+if($('snapMinSep')){
+  $('snapMinSep').value=snapMinSepMs;
+  $('snapMinSep').onchange=e=>{
+    snapMinSepMs=parseInt(e.target.value,10);
+    localStorage.setItem('tagSnapMinSep',snapMinSepMs);
+    refreshSnapPoints(true);
+  };
+}
+if($('snapShow')){
+  $('snapShow').checked=snapShow;
+  updateSnapVisibility();
+  const toggleSnap=()=>{
+    snapShow=$('snapShow').checked;
+    localStorage.setItem('tagSnapShow',snapShow?'1':'0');
+    updateSnapVisibility();
+    draw();
+  };
+  $('snapShow').onchange=toggleSnap;
+  $('snapShow').onclick=toggleSnap;
+}
+$('setb').onclick=()=>setMark(now());
+function nudgeWithSnap(delta){
+  const cur=mark();
+  let target=cur+delta;
+  if(snapShow && snapPoints && snapPoints.length){
+    let closest=null, minD=Infinity;
+    for(let i=0;i<snapPoints.length;i++){
+      const s=snapPoints[i];
+      // When marker is exactly on a segmentation line, ignore it so user can escape;
+      // Also do not snap backwards against the nudge direction
+      if(delta>0 && s<=cur+0.0015) continue;
+      if(delta<0 && s>=cur-0.0015) continue;
+      const d=Math.abs(target-s);
+      if(d<minD){ minD=d; closest=s; }
+    }
+    if(closest!==null && minD<=0.010) target=closest;
+  }
+  setMark(target);
+}
+$('m5').onclick=()=>nudgeWithSnap(-0.005); $('p5').onclick=()=>nudgeWithSnap(+0.005);
+$('fit').onclick=()=>{fitWord();draw();};
+$('fitall').onclick=()=>{view=[Math.max(tmin(),gold[0].start-0.2),
+  Math.min(total(),gold[gold.length-1].end+0.2)];draw();};
+$('addwb').onclick=addWordBefore; $('addw').onclick=addWord; $('delw').onclick=()=>delWord();
+$('untangleBtn').onclick=untangleWords;
+$('resetBaselineBtn').onclick=resetToBaseline;
+$('prevw').onclick=()=>goWord(wi-1); $('nextw').onclick=()=>goWord(wi+1);
+$('prevc').onclick=()=>{if(ci>0){ci--;loadClip();}};
+$('saveonly').onclick=save;
+$('save').onclick=saveNext;
+$('skip').onclick=()=>{if(ci<clips.length-1){ci++;loadClip();}};
+$('unmark').onclick=async ()=>{
+  if(sampleMode||isReadOnly) return;
+  await fetch(api('/api/unmark'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key:clips[ci].key})});
+  clips[ci].done=false;
+  render();
+};
+
+// ---- experimental: view a local CSV+WAV sample, no server involved --------
+// A drag-in preview: the CSV supplies word boundaries, the WAV supplies audio, and both
+// are decoded entirely client-side. `save`/`saveNext` already no-op under sampleMode, so
+// every edit made while inspecting a sample stays in memory and is never sent anywhere.
+function setClipActionsVisible(v){
+  $('clipNav').style.display=v?'inline-flex':'none'; $('saveRow').style.display=v?'':'none';
+  // Calling the aligner service costs real time and GPU money, unlike the local-only
+  // untangle/reset-baseline actions -- keep it out of read-only and sample-mode entirely
+  // rather than just no-op'ing its save like those do.
+  if(!v) cancelAlign();
+  $('alignBtn').style.display=v?'':'none'; $('alignStatus').style.display=v?'':'none';
+}
+function parseSampleCsv(text){
+  const lines=text.split(/\r\n|\n|\r/).map(l=>l.trim()).filter(l=>l.length);
+  if(!lines.length) throw new Error('file is empty');
+  let start=0;
+  const head=lines[0].split(',').map(s=>s.trim().toLowerCase());
+  if(head[0]==='word'&&head.length>=3) start=1;         // an optional header row
+  const words=[];
+  for(let i=start;i<lines.length;i++){
+    const parts=lines[i].split(',');
+    if(parts.length<3) throw new Error('row '+(i+1)+' is not Word,Start_Time,End_Time');
+    const word=parts[0].trim(), s=parseFloat(parts[1]), e=parseFloat(parts[2]);
+    if(!word) throw new Error('row '+(i+1)+' has no word');
+    if(!isFinite(s)||!isFinite(e)) throw new Error('row '+(i+1)+' has a non-numeric time');
+    if(e<=s) throw new Error('row '+(i+1)+': End_Time must be after Start_Time');
+    words.push({word,start:s,end:e});
+  }
+  if(!words.length) throw new Error('no data rows found');
+  return words;
+}
+const readAsText=file=>new Promise((res,rej)=>{
+  const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=()=>rej(r.error); r.readAsText(file);});
+const readAsArrayBuffer=file=>new Promise((res,rej)=>{
+  const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=()=>rej(r.error); r.readAsArrayBuffer(file);});
+async function tryLoadSample(){
+  if(!sampleCsv||!sampleWav) return;             // wait for both drops before doing anything
+  $('sampleErr').textContent='';
+  try{
+    const words=parseSampleCsv(sampleCsv.text);
+    ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();
+    const decoded=await ctx.decodeAudioData(sampleWav.buf.slice(0));
+    stop();
+    sampleMode=true;
+    sampleBaseline=words.map(w=>({...w}));
+    gold=words.map(w=>({...w})); touched=new Set();
+    wi=0; edge='end'; head=0; lead=0;              // local wav has no server-side pre-roll
+    buf=decoded; specCanvas=buildMelSpec(buf); snapPoints=specCanvas?(specCanvas.snapPoints||[]):[];
+    peaks=null; view=null; stretchCache.clear();
+    $('sampleUpload').style.display='none';
+    $('uploadSampleBtn').style.display='none';
+    $('removeSampleBtn').style.display='';
+    $('sampleBadge').style.display='';
+    setClipActionsVisible(false);
+    draw(); render();
+  }catch(err){
+    $('sampleErr').textContent='Could not load sample: '+err.message;
+  }
+}
+function resetDropzone(el,label){ el.classList.remove('loaded'); el.innerHTML=label; }
+const CSV_LABEL='Drop CSV file here<small>Word,Start_Time,End_Time</small>';
+const WAV_LABEL='Drop WAV file here<small>audio for the CSV above</small>';
+function wireDrop(zone,picker,onFile){
+  zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('dragover');});
+  zone.addEventListener('dragleave',()=>zone.classList.remove('dragover'));
+  zone.addEventListener('drop',e=>{
+    e.preventDefault(); zone.classList.remove('dragover');
+    const f=e.dataTransfer.files&&e.dataTransfer.files[0];
+    if(f) onFile(f);
+  });
+  zone.addEventListener('click',()=>picker.click());
+  picker.addEventListener('change',()=>{ if(picker.files[0]) onFile(picker.files[0]); picker.value=''; });
+}
+wireDrop($('csvDrop'),$('csvPick'),async f=>{
+  try{
+    sampleCsv={name:f.name,text:await readAsText(f)};
+    $('csvDrop').classList.add('loaded'); $('csvDrop').innerHTML='&#10003; '+f.name;
+    await tryLoadSample();
+  }catch(err){ $('sampleErr').textContent='Could not read CSV: '+err.message; }
+});
+wireDrop($('wavDrop'),$('wavPick'),async f=>{
+  try{
+    sampleWav={name:f.name,buf:await readAsArrayBuffer(f)};
+    $('wavDrop').classList.add('loaded'); $('wavDrop').innerHTML='&#10003; '+f.name;
+    await tryLoadSample();
+  }catch(err){ $('sampleErr').textContent='Could not read WAV: '+err.message; }
+});
+$('uploadSampleBtn').onclick=()=>{
+  $('sampleUpload').style.display='block';
+  $('uploadSampleBtn').style.display='none';
+};
+$('removeSampleBtn').onclick=async ()=>{
+  stop();
+  sampleMode=false; sampleCsv=null; sampleWav=null; sampleBaseline=null;
+  resetDropzone($('csvDrop'),CSV_LABEL); resetDropzone($('wavDrop'),WAV_LABEL);
+  $('sampleErr').textContent='';
+  $('sampleUpload').style.display='none';
+  $('removeSampleBtn').style.display='none';
+  $('sampleBadge').style.display='none';
+  $('uploadSampleBtn').style.display='';
+  setClipActionsVisible(true);
+  if(clips.length) await loadClip(); else draw();   // back to the normal tagging queue
+};
+
+// Persist without advancing: a text correction is worth keeping the moment it is made,
+// even on a clip whose boundaries are not finished.
+async function save(){
+  if(sampleMode||isReadOnly){ render(); return; }   // view-only: never tag, never call the server
+  await fetch(api('/api/gold'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({index:ci,key:clips[ci].key,words:gold,next:false})});
+  clips[ci].saved=gold.map(w=>({...w}));
+  render();
+}
+
+async function saveNext(){
+  if(sampleMode||isReadOnly){ render(); return; }
+  await fetch(api('/api/gold'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({index:ci,key:clips[ci].key,words:gold,next:true})});
+  clips[ci].saved=gold.map(w=>({...w}));
+  clips[ci].done=true;
+  if(ci<clips.length-1){ci++;await loadClip();} else render();
+}
+
+function showSaved(){
+  const box=$('savedItems'); box.innerHTML='';
+  $('savedCount').textContent='('+clips.length+')';
+  if(!clips.length){
+    box.innerHTML='<p>No clips assigned to you yet.</p>';
+  }else{
+    clips.forEach((c,i)=>{
+      const row=document.createElement('div');
+      row.className='savedItem'+(i===ci?' cur':'');
+      row.onclick=()=>{ ci=i; closeSaved(); loadClip(); };
+
+      const idx=document.createElement('span');
+      idx.className='savedIdx'; idx.textContent=(i+1)+'.';
+
+      const text=document.createElement('span');
+      text.className='savedText'; text.textContent=c.text||c.id||'';
+      text.title=c.id||'';
+
+      const saved=document.createElement('span');
+      saved.className='savedBadge'+(c.saved?' on':'');
+      saved.textContent=c.saved?'saved':'not saved';
+
+      const done=document.createElement('span');
+      done.className='savedBadge done'+(c.done?' on':'');
+      done.textContent=c.done?'done':'not done';
+
+      row.append(idx,text,saved,done);
+      box.appendChild(row);
+    });
+  }
+  $('savedlist').classList.add('on');
+}
+function closeSaved(){ $('savedlist').classList.remove('on'); }
+$('savedClose').onclick=closeSaved;
+$('savedlist').onclick=e=>{ if(e.target===$('savedlist')) closeSaved(); };
+
+addEventListener('keydown',async e=>{
+  // Never let the transport shortcuts fire while someone is typing: every letter of a
+  // name is also a shortcut here, so the name box would play, seek and re-mark as it
+  // was filled in.
+  if(/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)||e.target.isContentEditable)return;
+  if($('gate').classList.contains('on')||$('mgate').classList.contains('on'))return;
+  if($('savedlist').classList.contains('on')){ if(e.key==='Escape')closeSaved(); return; }
+  if(e.code==='Space'){e.preventDefault();toggle();return;}
+  if(e.key==='Escape'){loopKind=null;$('loopWord').classList.remove('on');$('loopMark').classList.remove('on');stop();head=0;seg=null;draw();return;}
+  if(e.key==='Tab'){e.preventDefault();(e.shiftKey?goWord(wi-1):goWord(wi+1));return;}
+  if(e.key==='q'){playBefore();return;}
+  if(e.key==='w'){playWord();return;}
+  if(e.key==='e'){playAfter();return;}
+  if(e.key==='l'){setLoop('mark');return;}
+  if(e.key==='L'){setLoop('word');return;}
+  if(e.key==='Home'){moveHead(0);return;}
+  // Ctrl+Shift+arrow nudges 5ms; Shift+arrow nudges 25ms (up/down 125ms); snaps within 10ms if enabled
+  if(e.key==='ArrowLeft'&&(e.ctrlKey||e.metaKey)&&e.shiftKey){e.preventDefault();nudgeWithSnap(-0.005);return;}
+  if(e.key==='ArrowRight'&&(e.ctrlKey||e.metaKey)&&e.shiftKey){e.preventDefault();nudgeWithSnap(+0.005);return;}
+  if(e.key==='ArrowLeft'&&e.shiftKey){e.preventDefault();nudgeWithSnap(-0.025);return;}
+  if(e.key==='ArrowRight'&&e.shiftKey){e.preventDefault();nudgeWithSnap(+0.025);return;}
+  if(e.key==='ArrowDown'&&e.shiftKey){e.preventDefault();nudgeWithSnap(-0.125);return;}
+  if(e.key==='ArrowUp'&&e.shiftKey){e.preventDefault();nudgeWithSnap(+0.125);return;}
+  if(e.key==='ArrowLeft'){e.preventDefault();stepMark(-1);return;}
+  if(e.key==='ArrowRight'){e.preventDefault();stepMark(1);return;}
+  if(e.key==='f'){setMark(now());return;}
+  if(isReadOnly && (e.key==='Enter'||((e.ctrlKey||e.metaKey)&&e.key==='s'))){
+    e.preventDefault(); return;
+  }
+  if(e.key==='Enter'){e.preventDefault();
+    if(e.ctrlKey||e.metaKey) await saveNext(); else await save(); return;}
+  if(e.key==='s'){if(e.ctrlKey||e.metaKey){e.preventDefault();await save();return;}
+    if(!sampleMode&&!isReadOnly&&ci<clips.length-1){ci++;await loadClip();}return;}
+});
+addEventListener('resize',()=>{peaks=null;draw();});
+$('ovFilterDone').onchange=renderOverviewList;
+$('ovFilterUser').onchange=renderOverviewList;
+$('ovSort').onchange=renderOverviewList;
+$('ovSearch').oninput=renderOverviewList;
+$('overviewLink').onclick=e=>{ e.preventDefault(); showOverview(); };
+$('alnAll').onclick=()=>setAllAln(true);
+$('alnNone').onclick=()=>setAllAln(false);
+$('evalLink').onclick=e=>{ e.preventDefault(); showEval(); };
+$('taggingLink').onclick=e=>{ e.preventDefault(); backToTagging(); };
+addEventListener('popstate',()=>{
+  const p=new URLSearchParams(location.search);
+  const v=p.get('view');
+  const c=p.get('clip');
+  if(v==='overview') showOverview();
+  else if(v==='eval') showEval();
+  else if(c) openClip(c);
+  else backToTagging();
+});
+boot().catch(e=>fail('The page could not start: '+(e&&e.message||e)));
