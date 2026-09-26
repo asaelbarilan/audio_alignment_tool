@@ -33,7 +33,15 @@ Output layout (an AudioFolder repo -- https://huggingface.co/docs/hub/datasets-a
 Each metadata.jsonl row:
 
     {"audio_file_name": "audio/<id>.wav", "id": "...", "metadata": {...},
-     "text": "...", "words": [{"word": "...", "start": 0.0, "end": 0.0}, ...]}
+     "text": "...", "words": [{"word": "...", "start": 0.0, "end": 0.0}, ...],
+     "annotator": "<name>"}
+
+`annotator` is who produced the row's words. By default each clip appears once, with the
+annotator whose claim is `done`. With --all-annotators, every other annotator who also saved
+marks for a done clip gets a row of their own for it too -- same `id` and audio, their own
+words -- so two people's timings of one clip can be compared. The evaluation project
+(eval-forced-alignment) reads both shapes and computes its human-agreement floor from the
+clips that have more than one row.
 
 `audio_file_name` (matching the Hub's `*_file_name` convention) is what makes the Hub's
 AudioFolder loader link each row back to its audio file with no extra config.
@@ -123,6 +131,12 @@ def parse_args() -> argparse.Namespace:
         "the repo is created).",
     )
     parser.add_argument(
+        "--all-annotators",
+        action="store_true",
+        help="Also publish, for every done clip, the marks of each other annotator who saved "
+        "some, as extra rows with the same id. Default: only the done claimant's.",
+    )
+    parser.add_argument(
         "--workers", type=int, default=8, help="Parallel audio-download threads (default: 8)."
     )
     args = parser.parse_args()
@@ -182,7 +196,7 @@ def load_file_marks(out_dir: Path) -> dict[str, dict[str, list]]:
     return marks
 
 
-def compose_row(clip: dict, words: list[dict]) -> dict:
+def compose_row(clip: dict, words: list[dict], annotator: str) -> dict:
     kept = [{"word": w["word"], "start": w["start"], "end": w["end"]} for w in words]
     return {
         "audio_file_name": clip["audio"],
@@ -190,6 +204,7 @@ def compose_row(clip: dict, words: list[dict]) -> dict:
         "metadata": clip.get("metadata", {}),
         "text": " ".join(w["word"] for w in kept),
         "words": kept,
+        "annotator": annotator,
     }
 
 
@@ -208,6 +223,7 @@ def main() -> None:
     rows: list[dict] = []
     missing_manifest = 0
     missing_marks = 0
+    extra_rows = 0
     for clip_id, entries in done_by_clip.items():
         annotator, _claimed_at = entries[0]  # earliest-claimed among ties, see docstring
         clip = manifest_by_id.get(clip_id)
@@ -215,13 +231,19 @@ def main() -> None:
             missing_manifest += 1
             continue
         if file_marks is not None:
-            words = file_marks.get(annotator, {}).get(clip_id)
+            by_who = {who: m[clip_id] for who, m in file_marks.items() if m.get(clip_id)}
         else:
-            words = store.clip_marks(clip_id).get(annotator)  # type: ignore[union-attr]
+            by_who = store.clip_marks(clip_id)  # type: ignore[union-attr]
+        words = by_who.get(annotator)
         if not words:
             missing_marks += 1
             continue
-        rows.append(compose_row(clip, words))
+        rows.append(compose_row(clip, words, annotator))
+        if args.all_annotators:
+            for other in sorted(by_who):
+                if other != annotator and by_who[other]:
+                    rows.append(compose_row(clip, by_who[other], other))
+                    extra_rows += 1
 
     if missing_manifest:
         print(f"skipping {missing_manifest} done clip(s) no longer in the manifest", file=sys.stderr)
@@ -234,8 +256,9 @@ def main() -> None:
     if not rows:
         raise SystemExit("nothing left to publish once unresolved clips were skipped")
 
-    rows.sort(key=lambda r: r["id"])
-    print(f"{len(rows)} labeled clip(s) to publish")
+    rows.sort(key=lambda r: (r["id"], r["annotator"]))
+    print(f"{len(rows)} labeled row(s) to publish"
+          + (f", {extra_rows} of them second annotators' marks" if extra_rows else ""))
 
     keep_local = args.local_target is not None
     working_dir = args.local_target or Path(tempfile.mkdtemp(prefix="publish_labeled_dataset_"))
@@ -249,12 +272,13 @@ def main() -> None:
 
         fetched = 0
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(fetch, row): row["id"] for row in rows}
+            unique = list({row["audio_file_name"]: row for row in rows}.values())
+            futures = {pool.submit(fetch, row): row["id"] for row in unique}
             for future in as_completed(futures):
                 future.result()
                 fetched += 1
-                if fetched % 25 == 0 or fetched == len(rows):
-                    print(f"  {fetched}/{len(rows)} audio file(s) fetched")
+                if fetched % 25 == 0 or fetched == len(unique):
+                    print(f"  {fetched}/{len(unique)} audio file(s) fetched")
 
         metadata_path = working_dir / "metadata.jsonl"
         with metadata_path.open("w", encoding="utf-8") as fh:
@@ -273,7 +297,7 @@ def main() -> None:
                 folder_path=str(working_dir),
                 repo_id=args.hf_target,
                 repo_type="dataset",
-                commit_message=f"Publish {len(rows)} labeled clip(s) from {args.dataset}",
+                commit_message=f"Publish {len(unique)} labeled clip(s) from {args.dataset}",
             )
             print(f"published to https://huggingface.co/datasets/{args.hf_target}")
     finally:

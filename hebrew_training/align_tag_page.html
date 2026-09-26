@@ -302,10 +302,20 @@
     <h2>Aligner evaluation</h2>
     <p class="evNote" id="evSummary">Loading...</p>
     <div class="evDl">
-      <a id="evDlMarks" href="#" download="gold.jsonl">&#8595; download marks (.jsonl)</a>
-      <a id="evDlResults" href="#" download="aligner_eval.json">&#8595; download results (.json)</a>
-      <span class="evDlNote">Re-run offline on the marks file: <code>eval/run_eval.py</code> (see eval/README.md)</span>
+      <label for="evPick">result</label>
+      <select id="evPick"></select>
+      <span id="evUpWrap" hidden>
+        <input type="file" id="evUpload" accept=".json,application/json" hidden>
+        <button id="evUploadBtn" title="A result.json written by eval-forced-alignment">&#8593; upload result</button>
+        <button id="evDeleteBtn" title="Remove this result from the site">delete</button>
+      </span>
+      <a id="evDlResults" href="#" download="result.json">&#8595; download (.json)</a>
+      <a id="evDlMarks" href="#" download="gold.jsonl">&#8595; current marks (.jsonl)</a>
     </div>
+    <p class="evNote" id="evMeta"></p>
+    <p class="evNote">Results are computed offline by <code>eval-forced-alignment</code>
+      (<code>python -m efa.run --input &lt;published gold set&gt;</code>) and uploaded here;
+      this screen only displays them.</p>
     <p class="evNote">Boundary error is how far an aligner put a word's start and end from
       where a person marked it. <b>Rank by p90, not the median</b>: an aligner that is usually
       close but sometimes half a second out still cuts training clips mid-word. The dashed
@@ -703,7 +713,9 @@ const ALIGNER_DESC={
 const fmtMs=v=>(v==null?'&ndash;':Math.round(v)+' ms');
 const errClass=v=>v==null?'':(v<=50?'evGood':(v<=100?'evMid':'evBad'));
 
-async function showEval(){
+let EVAL_LIST=[], EVAL_CUR=null, EVAL_DATA=null;
+
+async function showEval(pick){
   stop(); cancelAlign();
   $('workspace').style.display='none';
   $('overviewScreen').classList.remove('on');
@@ -713,41 +725,103 @@ async function showEval(){
   $('taggingLink').style.display='';
   setUrlParam('view','eval');
   setUrlParam('clip',null);
-  // Through api() so a token-gated server still accepts them; the marks file is exactly
-  // what eval/run_eval.py takes as --marks.
   $('evDlMarks').href=api('/api/export');
-  const res=api('/api/eval');
-  $('evDlResults').href=res+(res.includes('?')?'&':'?')+'download=1';
-  // The server computes in a worker and answers "computing" until it is done, so a slow
-  // first run cannot sit on an open connection until a gateway gives up.
-  const started=Date.now();
-  for(;;){
-    let r, d;
-    try{ r=await fetch(api('/api/eval')); }
-    catch(e){ $('evSummary').textContent='Could not reach the server.'; return; }
-    if(!r.ok){ $('evSummary').textContent='Could not load the evaluation ('+r.status+').'; return; }
-    try{ d=await r.json(); }
-    catch(e){ $('evSummary').textContent='The server sent something unreadable.'; return; }
-    if(d.status==='error'){ $('evSummary').textContent='The evaluation failed: '+d.error; return; }
-    if(d.status!=='computing'){ renderEval(d); return; }
-    if(Date.now()-started>300000){ $('evSummary').textContent='The evaluation is taking too long; check the server log.'; return; }
-    const secs=Math.round((Date.now()-started)/1000);
-    $('evSummary').textContent='Scoring '+(d.clips||'')+' clips and running the significance tests'
-      +' — first time only, then it is cached ('+secs+'s)';
-    if(document.getElementById('evalScreen') && !document.getElementById('evalScreen').classList.contains('on')) return;
-    await new Promise(r=>setTimeout(r,2000));
+  let d;
+  try{
+    const r=await fetch(api('/api/eval-results'));
+    if(!r.ok){ $('evSummary').textContent='Could not list results ('+r.status+').'; return; }
+    d=await r.json();
+  }catch(e){ $('evSummary').textContent='Could not reach the server.'; return; }
+  EVAL_LIST=d.results||[];
+  $('evUpWrap').hidden=!d.can_upload;
+  $('evDeleteBtn').style.display=EVAL_LIST.length?'':'none';
+  const want=pick||new URL(location.href).searchParams.get('result')||EVAL_CUR;
+  const cur=EVAL_LIST.find(e=>e.id===want)||EVAL_LIST[0];
+  $('evPick').innerHTML=EVAL_LIST.map(e=>'<option value="'+e.id+'">'
+    +String(e.title||e.id).replace(/</g,'&lt;')+' &middot; '+(e.created_at||e.uploaded_at||'').slice(0,10)
+    +'</option>').join('');
+  if(!cur){
+    EVAL_CUR=null; EVAL_DATA=null;
+    $('evDlResults').style.display='none';
+    $('evMeta').textContent='';
+    renderEval({});
+    $('evSummary').textContent='No results uploaded yet.'+(d.can_upload?' Upload a result.json from eval-forced-alignment.':'');
+    return;
   }
+  $('evPick').value=cur.id;
+  await loadEvalResult(cur.id);
+}
+
+async function loadEvalResult(id){
+  $('evSummary').textContent='Loading...';
+  const url=api('/api/eval-results/'+encodeURIComponent(id));
+  $('evDlResults').href=url; $('evDlResults').style.display='';
+  $('evDlResults').download=id+'.json';
+  let d;
+  try{
+    const r=await fetch(url);
+    if(!r.ok){ $('evSummary').textContent='Could not load that result ('+r.status+').'; return; }
+    d=await r.json();
+  }catch(e){ $('evSummary').textContent='Could not load that result.'; return; }
+  EVAL_CUR=id; EVAL_DATA=d;
+  setUrlParam('result',id);
+  renderEvalMeta(d);
+  renderEval(d);
+}
+
+// Where the result came from, and which aligners it could not run, so a missing row says why.
+function renderEvalMeta(d){
+  const esc=v=>String(v==null?'':v).replace(/[&<]/g,c=>c==='&'?'&amp;':'&lt;');
+  const inp=d.input||{};
+  let m='Input: <b>'+esc(inp.ref)+'</b>'+(inp.revision?' @ <code>'+esc(String(inp.revision).slice(0,12))+'</code>':'')
+    +(inp.rows!=null?' &middot; '+inp.rows+' marks on '+inp.clips+' clips':'')
+    +' &middot; computed '+esc((d.created_at||'').replace('T',' ').slice(0,16))
+    +(d.producer&&d.producer.git?' by eval-forced-alignment <code>'+esc(d.producer.git)+'</code>':'');
+  const st=d.aligner_status||{};
+  const off=Object.entries(st).filter(([,s])=>s.status!=='ok'&&s.status!=='imported');
+  if(off.length) m+='<br>Not scored: '+off.map(([n,s])=>'<b>'+esc(n)+'</b> ('+esc(s.reason||s.status)+')').join('; ');
+  const imp=Object.entries(st).filter(([,s])=>s.status==='imported');
+  if(imp.length) m+='<br>Aligned on another machine: '+imp.map(([n,s])=>esc(n)
+    +(s.provenance&&s.provenance.host?' on '+esc(s.provenance.host):'')).join(', ');
+  const failed=Object.entries(st).filter(([,s])=>s.failed&&s.failed.length);
+  if(failed.length) m+='<br>Clips an aligner could not align: '+failed.map(([n,s])=>esc(n)+' '+s.failed.length).join(', ');
+  $('evMeta').innerHTML=m;
+}
+
+$('evPick').onchange=()=>loadEvalResult($('evPick').value);
+$('evUploadBtn').onclick=()=>$('evUpload').click();
+$('evUpload').onchange=async()=>{
+  const f=$('evUpload').files[0]; $('evUpload').value='';
+  if(!f) return;
+  $('evSummary').textContent='Uploading '+f.name+'...';
+  try{
+    const r=await fetch(api('/api/eval-results'),{method:'POST',headers:{'Content-Type':'application/json'},body:await f.text()});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){ $('evSummary').textContent='Upload refused: '+(d.error||r.status); return; }
+    await showEval(d.id);
+  }catch(e){ $('evSummary').textContent='Upload failed: '+e; }
+};
+$('evDeleteBtn').onclick=async()=>{
+  if(!EVAL_CUR||!confirm('Delete this result from the site? The file itself is not affected.')) return;
+  const r=await fetch(api('/api/eval-results/delete'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:EVAL_CUR})});
+  if(!r.ok){ alert('Could not delete ('+r.status+')'); return; }
+  EVAL_CUR=null; setUrlParam('result',null);
+  await showEval();
+};
+
+// The result's own alignments for a clip, as lanes: those are what was scored, and the
+// dataset's labels may be older runs or absent. The first annotator's words are used when
+// several people marked the clip, since each got their own alignment.
+function evalLanes(id){
+  const c=EVAL_DATA&&EVAL_DATA.clip_data&&EVAL_DATA.clip_data[id];
+  if(!c||!c.labels) return null;
+  return Object.entries(c.labels).map(([name,byWho])=>{
+    const who=Object.keys(byWho).sort()[0];
+    return {source:name, words:byWho[who]};
+  }).filter(l=>l.words&&l.words.length);
 }
 
 function renderEval(d){
-  // A status payload is not a result. An older cached page rendered one as if it were and
-  // announced "no marked clips" while the server was still computing them.
-  if(d && d.status){
-    $('evSummary').textContent = d.status==='error'
-      ? 'The evaluation failed: '+d.error
-      : 'Still scoring on the server — reload in a moment.';
-    return;
-  }
   const people=Object.entries(d.annotators||{}).map(([n,c])=>n+' '+c).join(', ');
   $('evSummary').innerHTML=d.marked_clips
     ? '<b>'+d.marked_clips+'</b> clips marked by '+people
@@ -756,7 +830,7 @@ function renderEval(d){
   const ranked=Object.entries(d.aligners||{}).filter(([,s])=>s.boundaries)
     .sort((a,b)=>a[1].p90_ms-b[1].p90_ms);
   if(!ranked.length){
-    $('evTable').innerHTML='<tr><td class="evEmpty">Nothing to score yet &mdash; mark a clip first.</td></tr>';
+    $('evTable').innerHTML='<tr><td class="evEmpty">Nothing scored in this result.</td></tr>';
     $('evBars').innerHTML=''; $('evClips').innerHTML=''; $('evLegend').textContent='';
     $('evSig').innerHTML=''; $('evWarn').hidden=true;
     return;
@@ -771,24 +845,26 @@ function renderEval(d){
   const TOL=[10,25,50,100];
   const row=(name,s,cls)=>{
     const ci=s.ci||{}, e=s.ends||{};
-    const seedTag=(name===d.seed)?'<span class="evSeed">marks started here &mdash; flattered</span>':'';
+    const seedTag=(d.seed&&name===d.seed)?'<span class="evSeed">marks started here &mdash; flattered</span>':'';
+    const desc=((d.aligner_status||{})[name]||{}).description||ALIGNER_DESC[name];
     return '<tr class="'+cls+'"><td><span class="evName">'+name+'</span>'
-      +(ALIGNER_DESC[name]?'<span class="evDesc">'+ALIGNER_DESC[name]+'</span>':'')+seedTag+'</td>'
+      +(desc?'<span class="evDesc">'+desc+'</span>':'')+seedTag+'</td>'
       +'<td class="'+errClass(s.median_ms)+'">'+withCi(s.median_ms,ci.median_ms,'ms')+'</td>'
       +'<td class="'+errClass(s.p90_ms)+'">'+withCi(s.p90_ms,ci.p90_ms,'ms')+'</td>'
       +TOL.map(x=>'<td>'+withCi(s['within_'+x+'ms'],ci['within_'+x+'ms'],'%')+'</td>').join('')
       +'<td class="evEnds '+errClass(e.median_ms)+'">'+fmtMs(e.median_ms)+'</td>'
       +'<td class="evEnds '+errClass(e.p90_ms)+'">'+fmtMs(e.p90_ms)+'</td>'
       +'<td class="evEnds">'+(e.within_50ms!=null?e.within_50ms+'%':'&ndash;')+'</td>'
-      +'<td>'+(s.unmoved_pct!=null?s.unmoved_pct+'%':'&ndash;')+'</td></tr>';
+      +(hasUnmoved?'<td>'+(s.unmoved_pct!=null?s.unmoved_pct+'%':'&ndash;')+'</td>':'')+'</tr>';
   };
+  const hasUnmoved=ranked.some(([,s])=>s.unmoved_pct!=null);
   let t='<tr><th>aligner</th><th>median</th><th>p90</th>'
     +TOL.map(x=>'<th>&le;'+x+' ms</th>').join('')
     +'<th class="evEnds" title="Word ends only. MWA predicts nothing else: its starts are '
     +'copied from the end of the word before it by its own writer, so this is the fair '
     +'column">ends: median</th><th class="evEnds">ends: p90</th>'
     +'<th class="evEnds">ends: &le;50 ms</th>'
-    +'<th title="Human boundaries left exactly where this aligner put them">unmoved</th></tr>';
+    +(hasUnmoved?'<th title="Human boundaries left exactly where this aligner put them">unmoved</th>':'')+'</tr>';
   ranked.forEach(([n,s],i)=>{ t+=row(n,s,i===0&&n!==d.seed?'best':''); });
   const h=d.human_agreement;
   if(h){
@@ -800,7 +876,7 @@ function renderEval(d){
       +'<td class="evEnds">'+fmtMs((h.ends||{}).median_ms)+'</td>'
       +'<td class="evEnds">'+fmtMs((h.ends||{}).p90_ms)+'</td>'
       +'<td class="evEnds">'+(((h.ends||{}).within_50ms!=null)?h.ends.within_50ms+'%':'&ndash;')+'</td>'
-      +'<td></td></tr>';
+      +(hasUnmoved?'<td></td>':'')+'</tr>';
   }
   $('evTable').innerHTML=t;
   renderSignificance(d);
@@ -833,7 +909,7 @@ function renderEval(d){
       e.preventDefault();
       alnForceAll=true; alnSig=null;
       $('evalScreen').classList.remove('on'); $('evalLink').classList.remove('cur');
-      openClip(tr.dataset.id);
+      openClip(tr.dataset.id, false, evalLanes(tr.dataset.id));
     };
   });
 }
@@ -1070,7 +1146,7 @@ async function claimClip(key){
   }
 }
 
-async function openClip(key, forceReadOnly){
+async function openClip(key, forceReadOnly, extraLanes){
   stop(); cancelAlign();
   const r=await fetch(api('/api/clip-marks?key='+encodeURIComponent(key)));
   if(!r.ok){
@@ -1078,6 +1154,12 @@ async function openClip(key, forceReadOnly){
     return;
   }
   const data=await r.json();
+  if(extraLanes&&extraLanes.length){
+    // An eval result's alignment replaces the dataset's label of the same name: it is the
+    // one the numbers on the eval screen were computed from.
+    const over=new Set(extraLanes.map(l=>l.source));
+    data.labels=[...(data.labels||[]).filter(l=>!over.has(l.source)),...extraLanes];
+  }
   currentClipDetail=data;
 
   const isMine=Boolean(data.claim&&data.claim.claimed_by_me);
@@ -1390,6 +1472,14 @@ async function load(){
   }
   if(cl){
     PARAMS.delete('clip');
+    const rid=PARAMS.get('result');
+    if(rid){
+      try{
+        const rr=await fetch(api('/api/eval-results/'+encodeURIComponent(rid)));
+        if(rr.ok){ EVAL_DATA=await rr.json(); EVAL_CUR=rid; }
+      }catch(e){}
+      return openClip(cl, false, evalLanes(cl));
+    }
     return openClip(cl);
   }
   // Land on the clip last worked on but not finished: the most recent one the annotator

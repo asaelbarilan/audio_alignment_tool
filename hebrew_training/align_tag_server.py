@@ -56,6 +56,7 @@ LOCK = threading.Lock()
 # on the container disk, which does not survive a redeploy.
 STORE = None
 CLAIMS = None
+RESULTS = None  # EvalResults, set in main()
 BLOCK = 10  # clips a person holds at once; refilled as they work
 # A claim nobody has finished can go back in the pool, so a person who opens the page and
 # wanders off does not strand their share -- but how long it gets to sit depends on whether
@@ -89,6 +90,15 @@ def parse_args() -> argparse.Namespace:
         help="Which dataset to serve -- a top-level folder name under --datasets-folder / "
         "--datasets-bucket. Falls back to the DATASET environment variable when the "
         "--dataset arg is not given.",
+    )
+    parser.add_argument(
+        "--eval-results-bucket",
+        default=os.environ.get("EVAL_RESULTS_BUCKET")
+        or os.environ.get("DATASETS_BUCKET")
+        or os.environ.get("S3_BUCKET", ""),
+        help="Bucket that keeps uploaded aligner-eval results, under eval-results/. Defaults "
+        "to the datasets bucket. Without one they go to <out>/_eval-results/, which a "
+        "redeploy wipes.",
     )
     parser.add_argument(
         "--out",
@@ -1558,71 +1568,106 @@ def load_saved(path: Path, clips: list[dict]) -> dict[int, list]:
     return out
 
 
-EVAL_CACHE: dict = {}
-EVAL_LOCK = threading.Lock()
+EVAL_SCHEMA = "efa-result/"
+EVAL_PREFIX = "eval-results/"
+EVAL_MAX_BYTES = 64 * 1024 * 1024
+_EVAL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
 
 
-def eval_inputs(args) -> tuple[list[dict], set[str]]:
-    """Everything the scorer is given: the marks, and the accounts to leave out of them."""
-    gold: list[dict] = []
-    if STORE is not None:
-        for name, payload in STORE.everything():
-            gold += [{**row, "annotator": name} for row in payload]
-    else:
-        for f in sorted(args.out.glob("*.jsonl")):
-            for line in f.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    gold.append({**json.loads(line), "annotator": f.stem})
-    exclude = {
-        n.strip()
-        for n in os.environ.get("EVAL_EXCLUDE", "probe").split(",")
-        if n.strip()
-    }
-    return gold, exclude
+class EvalResults:
+    """Scored results uploaded from eval-forced-alignment, which this site only displays.
 
-
-def eval_now(args, clips) -> tuple[dict | None, str | None, int]:
-    """The scored result if it is ready, starting the worker if it is not.
-
-    The bootstrap is the better part of a minute on a small host, so it never runs inside a
-    request -- the page is answered at once and polls. main() calls this at boot as well, so
-    the first person to open the dashboard after a deploy usually finds it already done
-    rather than watching a counter. Returns (result, error, marked clips).
+    Kept in the bucket, because a deploy restarts the container and its disk with it; a
+    folder when there is no bucket, which is the local case. An index object lists what is
+    stored, so the picker does not have to fetch every result -- each carries the whole gold
+    set and is a few megabytes.
     """
-    from hebrew_training.aligner_eval import evaluate
 
-    gold, exclude = eval_inputs(args)
-    known = {c["id"] for c in clips}
-    marked = len({g.get("id") for g in gold if g.get("id") in known})
-    # The answer only changes when someone saves a mark, so it is computed once per distinct
-    # set of marks and kept until they change.
-    fingerprint = hashlib.sha256(
-        json.dumps([gold, sorted(exclude)], sort_keys=True, ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
+    def __init__(self, bucket: str | None, folder: Path):
+        self.bucket = bucket
+        self.folder = folder
+        self.lock = threading.Lock()
 
-    def compute():
-        try:
-            out = evaluate(clips, gold, exclude=exclude)
-            out["excluded"] = sorted(exclude)
-            with EVAL_LOCK:
-                EVAL_CACHE.update(key=fingerprint, result=out, error=None)
-        except Exception as exc:  # noqa: BLE001 -- report it, do not lose it
-            with EVAL_LOCK:
-                EVAL_CACHE.update(
-                    key=fingerprint, result=None, error=f"{type(exc).__name__}: {exc}"
-                )
-        finally:
-            with EVAL_LOCK:
-                EVAL_CACHE["running"] = None
+    def where(self) -> str:
+        return f"s3://{self.bucket}/{EVAL_PREFIX}" if self.bucket else str(self.folder)
 
-    with EVAL_LOCK:
-        hit = EVAL_CACHE.get("key") == fingerprint
-        cached = EVAL_CACHE.get("result") if hit else None
-        failed = EVAL_CACHE.get("error") if hit else None
-        if cached is None and failed is None and EVAL_CACHE.get("running") != fingerprint:
-            EVAL_CACHE["running"] = fingerprint
-            threading.Thread(target=compute, daemon=True).start()
-    return cached, failed, marked
+    def _get(self, name: str) -> bytes | None:
+        if self.bucket:
+            try:
+                return s3_client().get_object(Bucket=self.bucket, Key=EVAL_PREFIX + name)["Body"].read()
+            except Exception as exc:  # noqa: BLE001
+                if "NoSuchKey" in type(exc).__name__ or "NoSuchKey" in str(exc) or "404" in str(exc):
+                    return None
+                raise
+        f = self.folder / name
+        return f.read_bytes() if f.exists() else None
+
+    def _put(self, name: str, body: bytes) -> None:
+        if self.bucket:
+            s3_client().put_object(Bucket=self.bucket, Key=EVAL_PREFIX + name, Body=body,
+                                   ContentType="application/json")
+        else:
+            self.folder.mkdir(parents=True, exist_ok=True)
+            (self.folder / name).write_bytes(body)
+
+    def _drop(self, name: str) -> None:
+        if self.bucket:
+            s3_client().delete_object(Bucket=self.bucket, Key=EVAL_PREFIX + name)
+        else:
+            (self.folder / name).unlink(missing_ok=True)
+
+    def index(self) -> list[dict]:
+        raw = self._get("index.json")
+        return json.loads(raw) if raw else []
+
+    def get(self, rid: str) -> bytes | None:
+        return self._get(f"{rid}.json") if _EVAL_ID.match(rid) else None
+
+    def add(self, result: dict, body: bytes, uploader: str | None) -> dict:
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        rid = f"{stamp}-{hashlib.sha256(body).hexdigest()[:8]}"
+        aligners = result.get("aligners") or {}
+        entry = {
+            "id": rid,
+            "title": str(result.get("title") or rid)[:200],
+            "created_at": result.get("created_at"),
+            "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "uploaded_by": uploader,
+            "input": result.get("input"),
+            "clips": result.get("marked_clips"),
+            "aligners": sorted(aligners),
+            "bytes": len(body),
+        }
+        self._put(f"{rid}.json", body)
+        with self.lock:
+            idx = [e for e in self.index() if e.get("id") != rid]
+            idx.insert(0, entry)
+            self._put("index.json", json.dumps(idx, ensure_ascii=False).encode("utf-8"))
+        return entry
+
+    def delete(self, rid: str) -> bool:
+        if not _EVAL_ID.match(rid):
+            return False
+        with self.lock:
+            idx = self.index()
+            kept = [e for e in idx if e.get("id") != rid]
+            if len(kept) == len(idx):
+                return False
+            self._put("index.json", json.dumps(kept, ensure_ascii=False).encode("utf-8"))
+        self._drop(f"{rid}.json")
+        return True
+
+
+def check_result(result) -> str | None:
+    """Why this upload is not a result the viewer can show, or None."""
+    if not isinstance(result, dict):
+        return "not a JSON object"
+    if not str(result.get("schema", "")).startswith(EVAL_SCHEMA):
+        return (f"schema is {result.get('schema')!r}, expected {EVAL_SCHEMA}N -- upload the "
+                "result.json eval-forced-alignment writes")
+    if not isinstance(result.get("aligners"), dict):
+        return "no aligners in it"
+    return None
 
 
 def make_handler(args, dataset: Dataset, clips):
@@ -1811,35 +1856,25 @@ def make_handler(args, dataset: Dataset, clips):
                         json.dumps({"error": str(exc), "message": str(exc)}).encode("utf-8"),
                         "application/json",
                     )
-            if route == "/api/eval":
-                # The same rows /api/export hands out, scored by the same module the local
-                # script uses -- so the dashboard and a downloaded file cannot disagree.
-                # Never in the request: holding the connection open for the bootstrap leaves
-                # the page on "Loading..." until the platform's gateway kills it, with no
-                # error to show.
-                cached, failed, marked = eval_now(args, clips)
-                if cached is None:
-                    body = ({"status": "error", "error": failed} if failed
-                            else {"status": "computing", "clips": marked})
-                    return self.send(
-                        200,
-                        json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                        "application/json; charset=utf-8",
-                    )
-                result = cached
-                from urllib.parse import parse_qs
-
-                wants_file = "download" in parse_qs(urlparse(self.path).query)
+            if route == "/api/eval-results":
+                try:
+                    listing = RESULTS.index()
+                except Exception as exc:  # noqa: BLE001
+                    return self.send(502, json.dumps({"error": f"{type(exc).__name__}: {exc}"}).encode("utf-8"),
+                                     "application/json")
+                _, admin = self.standing()
                 return self.send(
                     200,
-                    json.dumps(result, ensure_ascii=False, indent=2 if wants_file else None).encode(
-                        "utf-8"
-                    ),
+                    json.dumps({"results": listing, "can_upload": admin or not args.auth or not admins()},
+                               ensure_ascii=False).encode("utf-8"),
                     "application/json; charset=utf-8",
-                    {"Content-Disposition": 'attachment; filename="aligner_eval.json"'}
-                    if wants_file
-                    else None,
                 )
+            if route.startswith("/api/eval-results/"):
+                body = RESULTS.get(route.rsplit("/", 1)[1])
+                if body is None:
+                    return self.send(404, b'{"error":"no such result"}', "application/json")
+                return self.send(200, body, "application/json; charset=utf-8",
+                                 {"Cache-Control": "private, max-age=3600"})
             if route == "/api/export":
                 # The marks live in Postgres once hosted, but the rest of the pipeline reads
                 # jsonl keyed on clip id. So export in exactly that shape, with the
@@ -1903,14 +1938,7 @@ def make_handler(args, dataset: Dataset, clips):
                     # reporting "no marked clips" while marks plainly exist can only be
                     # guessed at from outside, since every other route needs a sign-in.
                     "labels": sorted({lb["source"] for c in clips for lb in c.get("labels", [])}),
-                    "eval": {
-                        "computed": EVAL_CACHE.get("result") is not None,
-                        "running": bool(EVAL_CACHE.get("running")),
-                        "error": EVAL_CACHE.get("error"),
-                        "marked_clips": (EVAL_CACHE.get("result") or {}).get("marked_clips"),
-                        "unmatched_marks": (EVAL_CACHE.get("result") or {}).get("unmatched_marks"),
-                        "scored": sorted((EVAL_CACHE.get("result") or {}).get("aligners", {})),
-                    },
+                    "eval_results": RESULTS.where(),
                 }
                 # Where the audio is actually coming from. Without this there is no way to
                 # tell from outside which dataset source is live.
@@ -2195,6 +2223,38 @@ def make_handler(args, dataset: Dataset, clips):
                 return self.send(
                     200, json.dumps({"name": bound}).encode("utf-8"), "application/json"
                 )
+            if route in ("/api/eval-results", "/api/eval-results/delete"):
+                # Only approvers publish results: everyone who can sign in can read them, and
+                # a result is the thing people quote.
+                _, admin = self.standing()
+                if args.auth and admins() and not admin:
+                    return self.send(403, b'{"error":"only approvers can upload results"}',
+                                     "application/json")
+                length = int(self.headers.get("Content-Length", 0))
+                if length > EVAL_MAX_BYTES:
+                    return self.send(413, b'{"error":"result too large"}', "application/json")
+                raw = self.rfile.read(length)
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                except ValueError as exc:
+                    return self.send(400, json.dumps({"error": f"not JSON: {exc}"}).encode("utf-8"),
+                                     "application/json")
+                try:
+                    if route.endswith("/delete"):
+                        if not RESULTS.delete(str(body.get("id", ""))):
+                            return self.send(404, b'{"error":"no such result"}', "application/json")
+                        return self.send(200, b'{"ok":true}', "application/json")
+                    why = check_result(body)
+                    if why:
+                        return self.send(400, json.dumps({"error": why}).encode("utf-8"),
+                                         "application/json")
+                    person = self.signed_in() or {}
+                    entry = RESULTS.add(body, raw, person.get("email") or self.who())
+                except Exception as exc:  # noqa: BLE001 -- a bucket error is shown, not swallowed
+                    return self.send(502, json.dumps({"error": f"{type(exc).__name__}: {exc}"}).encode("utf-8"),
+                                     "application/json")
+                return self.send(200, json.dumps(entry, ensure_ascii=False).encode("utf-8"),
+                                 "application/json; charset=utf-8")
             if route == "/api/approve":
                 approved, admin = self.standing()
                 if not admin:
@@ -2416,7 +2476,7 @@ def write_gold(out: Path, clips: list[dict], saved: dict[int, list]) -> None:
 
 
 def main() -> None:
-    global STORE, CLAIMS
+    global STORE, CLAIMS, RESULTS
     args = parse_args()
     if not args.datasets_bucket and not args.datasets_folder:
         raise SystemExit("one of --datasets-folder or --datasets-bucket is required")
@@ -2438,6 +2498,8 @@ def main() -> None:
     elif args.auth:
         print("google sign-in required; ?who= ignored")
     CLAIMS = STORE if STORE is not None else FileClaims(args.out)
+    RESULTS = EvalResults(args.eval_results_bucket or None, args.out / "_eval-results")
+    print(f"aligner eval results -> {RESULTS.where()}")
     print(f"split is always on: each annotator gets their own clips, {BLOCK} at a time")
     try:
         aligner_config()
@@ -2468,15 +2530,6 @@ def main() -> None:
     )
     words = sum(len(c["a"]) for c in clips)
     print(f"{len(clips)} clips, {words} boundaries to check")
-    # Score straight away, in the background. The result is held in memory, so every deploy
-    # and every restart throws it away, and without this the first person to open the
-    # dashboard is the one who waits out the bootstrap.
-    try:
-        _, _, marked = eval_now(args, clips)
-        if marked:
-            print(f"scoring {marked} marked clips in the background for the dashboard")
-    except Exception as exc:  # noqa: BLE001 -- a warm cache is a nicety, not a reason to fail
-        print(f"could not start the evaluation: {type(exc).__name__}: {exc}")
     where = "localhost" if args.host in ("127.0.0.1", "localhost") else args.host
     link = f"http://{where}:{args.port}/"
     if args.token:

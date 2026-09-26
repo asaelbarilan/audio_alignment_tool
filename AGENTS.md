@@ -52,8 +52,8 @@ restarts the container, which is also how an env-var change takes effect.
 **Credentials are not in this repo and were held in the previous session's scratchpad, which
 is gone.** The xhostd API token and the S3 keys come from the xhostd dashboard; ask the user.
 
-`/api/progress` is the only route without a sign-in and reports clips, marks, labels and the
-scorer's state. It is the first thing to look at when the site misbehaves, and it was added
+`/api/progress` is the only route without a sign-in and reports clips, marks, labels and where eval
+results are stored. It is the first thing to look at when the site misbehaves, and it was added
 after an afternoon lost to guessing.
 
 ### Sign-in and the approval gate
@@ -120,8 +120,10 @@ Held out (fit on half the clips, score the other half, swap): median 29.5 → 23
 It helps 87 of those 143 ends and hurts 25 — the 25 are ones MMS already had right, and I
 could not separate them with any feature available.
 
-`eval/correct_mms.py` measures it and writes `correction.json`; `eval/push_corrected.py`
-applies it to a whole manifest. `eval/README.md` has the commands.
+All evaluation code, the correction included, moved to `../eval-forced-alignment` on
+2026-09-26: `correction/correct_mms.py` measures it and writes `correction.json`,
+`correction/push_corrected.py` applies it to a whole manifest. This site only displays
+uploaded `result.json` files (aligner eval screen); nothing is scored here any more.
 
 ## What was tried and did not work
 
@@ -146,7 +148,7 @@ Do not re-propose these without new data. All are written up with numbers.
 
 ## Mismatch detection, and why it is repair not filtering
 
-`eval/mismatch.py`, `eval/mismatch_report.py`, `eval/unclaimed_*.py`.
+`research/mismatch.py`, `research/mismatch_report.py`, `research/unclaimed_*.py` in `../eval-forced-alignment`.
 
 - A word **in the text but not the audio** is findable: CTC score 0.04 against 0.66 for a
   real word; 53% caught at a 5% false-alarm rate. Duration is a poor signal, 4%.
@@ -162,10 +164,10 @@ Do not re-propose these without new data. All are written up with numbers.
 ## Environments
 
 The aligners have incompatible dependencies, so each has its own interpreter, named in `.env`
-(see `eval/README.md`). **There is no `.env` in the repo right now** — recreate it.
+(see `../eval-forced-alignment/README.md`, which now builds them as uv projects under `envs/`).
 
 - `ctc-env/` — torch (CPU), torchaudio, transformers, uroman, soundfile, scipy, matplotlib,
-  phonikud, phonikud-onnx. Runs the CTC aligners and everything in `eval/` that needs audio.
+  phonikud, phonikud-onnx. Runs the CTC aligners and the research scripts that need audio.
   CPU is fine: `forced_align` has no CUDA kernel anyway and timings reproduce the GPU run
   exactly.
 - `C:\Users\Asael\PycharmProjects\Multilingual-Word-Aligner\.venv` — MWA's own environment.

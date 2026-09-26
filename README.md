@@ -20,21 +20,24 @@ somebody lets it in, from the **approvals** screen. Who may do that is `TAG_ADMI
 of addresses in the environment. Leave it unset and the gate is off, since a gate with no
 keyholder only strands people; the annotators already working are grandfathered in.
 
-## Scoring the aligners, and correcting one
+## Scoring the aligners
 
-`eval/` holds everything behind the **aligner eval** screen — read `eval/README.md` first.
+The scoring lives in a sibling repo, **`../eval-forced-alignment`** (history carried over from
+the old `eval/` folder). The loop:
 
-- `eval/run_eval.py` runs every aligner over the marked clips and scores them against the
-  humans, with significance tests. Five are compared; MMS wins.
-- `eval/correct_mms.py` is the one to know about. `mms-corrected` is not a sixth aligner:
-  it is MMS's own output moved, so **MMS never has to be run again**. Two rules — a shift
-  set by the letter at each boundary (the first letter moves the start, the last letter the
-  end), then, for a word end with a pause after it, an
-  extension to where the sound actually stops. Held out: median error 29.5 → 23.4 ms, and
-  on those pre-pause ends p90 187 → 133 ms. It needs the existing timings plus the audio,
-  and no model.
-- `eval/push_corrected.py` applies it to a whole dataset, adding `mms-corrected` beside the
-  labels already there and leaving untouched any clip that has no `mms` label.
+1. Publish the done clips: `python -m hebrew_training.publish_labeled_dataset --dataset <name>
+   --hf-target <owner/repo>` (or `--local-target <dir>`). Each row carries its `annotator`;
+   `--all-annotators` adds other annotators' marks of the same clip, which is what the
+   human-agreement floor is computed from.
+2. In `eval-forced-alignment`: `uv run python -m efa.run --input <owner/repo or dir>`. Every
+   aligner times the human-corrected words; the output is one self-contained `result.json`.
+3. Upload it on the **aligner eval** screen (approvers only). Results are stored in the bucket
+   under `eval-results/` (`EVAL_RESULTS_BUCKET`, defaulting to the datasets bucket), or in
+   `<out>/_eval-results/` with no bucket. The screen only displays them -- nothing is scored
+   on this server. Its per-clip *open* link shows the result's own alignments as lanes.
+
+`mms-corrected` -- MMS's own output moved by a per-letter shift and a pause-end extension,
+held out 29.5 → 23.4 ms median -- is fitted and applied there too (`correction/`).
 
 The **align** button re-times a clip from scratch by calling a Multilingual-Word-Aligner
 RunPod endpoint with the clip's audio and transcript (see `api-client-guide.md`), replacing
