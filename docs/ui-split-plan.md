@@ -14,9 +14,22 @@ One deviation from the plan below: `main.js` cannot carry the `__BUILD__` placeh
 the substitution stays in the HTML as `<script>window.PAGE_BUILD='__BUILD__'</script>`, and
 `main.js` just reads `window.PAGE_BUILD`.
 
-Step 3 (splitting `main.js` into the per-concern modules below) has not been done yet — it is
-one shared closure of mutable state (`gold`, `wi`, `buf`, `clips`, etc.) end to end, so it needs
-its own careful pass rather than a mechanical cut.
+Step 3 is done: `main.js` is split into `state.js`, `audio-engine.js`, `spectrogram.js`,
+`canvas-draw.js`, `words.js`, `align-client.js`, `screens/{gate,overview,eval,approvals}.js`,
+plus a much smaller `main.js` that wires everything together. Shared mutable state (`gold`,
+`wi`, `buf`, `clips`, etc.) lives on one exported object `S` from `state.js`, mutated in place
+by every module that needs it — a single-owner rebind wasn't possible given how many modules
+touch the same fields. `main.js` is never imported by another module (only loaded as the page's
+entry `<script src="...">`): a module reachable under two different URLs (with and without the
+`?v=` query string) gets instantiated twice by the browser, and the second instance of `main.js`
+was evaluating mid-way through the circular import chain, before `audio-engine.js` finished its
+top-level body — a real `Cannot access 'playBefore' before initialization` error, reproduced in
+a fresh browser context, not a caching artifact. Fix: the four call sites that needed something
+from `main.js` (`words.js`, `screens/gate.js`, `screens/overview.js`, `screens/eval.js`) now call
+`S.openClip`, `S.load`, `S.loadClip`, `S.showSaved`, which `main.js` assigns onto `S` at the
+bottom, instead of importing `main.js` directly. Verified with a fresh browser context: sign-in,
+name gate, a clip loading with real Hebrew words and a rendered waveform, word navigation,
+overview → Edit (`S.openClip`), and the eval screen all work with no console errors.
 
 ## Problem
 
