@@ -1,4 +1,4 @@
-import {S,$,api,setUrlParam} from '../state.js';
+import {S,$,api,setUrlParam,setTitle,EVAL_TITLE} from '../state.js';
 import {stop} from '../audio-engine.js';
 import {cancelAlign} from '../align-client.js';
 // main.js is not imported here: see the comment by its own S.openClip= assignment.
@@ -17,12 +17,15 @@ const errClass=v=>v==null?'':(v<=50?'evGood':(v<=100?'evMid':'evBad'));
 
 async function showEval(pick){
   stop(); cancelAlign();
+  $('publicEvalScreen').classList.remove('on');
   $('workspace').style.display='none';
   $('overviewScreen').classList.remove('on');
   $('overviewLink').classList.remove('cur');
   $('evalScreen').classList.add('on');
   $('evalLink').classList.add('cur');
   $('taggingLink').style.display='';
+  S.taggingEntered=false;
+  setTitle(EVAL_TITLE);
   setUrlParam('view','eval');
   setUrlParam('clip',null);
   $('evDlMarks').href=api('/api/export');
@@ -33,6 +36,7 @@ async function showEval(pick){
     d=await r.json();
   }catch(e){ $('evSummary').textContent='Could not reach the server.'; return; }
   S.evalList=d.results||[];
+  S.evalPublicId=d.public_id||null;
   $('evUpWrap').hidden=!d.can_upload;
   $('evDeleteBtn').style.display=S.evalList.length?'':'none';
   const want=pick||new URL(location.href).searchParams.get('result')||S.evalCur;
@@ -44,12 +48,21 @@ async function showEval(pick){
     S.evalCur=null; S.evalData=null;
     $('evDlResults').style.display='none';
     $('evMeta').textContent='';
-    renderEval({});
+    renderEval({},'ev');
     $('evSummary').textContent='No results uploaded yet.'+(d.can_upload?' Upload a result.json from eval-forced-alignment.':'');
+    refreshPublicButton();
     return;
   }
   $('evPick').value=cur.id;
   await loadEvalResult(cur.id);
+}
+
+// Whether the picked result is the one the public viewer shows, so the button reads
+// "set as public" or the badge does, never both.
+function refreshPublicButton(){
+  const isPublic=Boolean(S.evalCur)&&S.evalCur===S.evalPublicId;
+  $('evSetPublicBtn').hidden=!S.evalCur||isPublic;
+  $('evPublicBadge').hidden=!isPublic;
 }
 
 async function loadEvalResult(id){
@@ -65,12 +78,13 @@ async function loadEvalResult(id){
   }catch(e){ $('evSummary').textContent='Could not load that result.'; return; }
   S.evalCur=id; S.evalData=d;
   setUrlParam('result',id);
-  renderEvalMeta(d);
-  renderEval(d);
+  renderEvalMeta(d,'ev');
+  renderEval(d,'ev');
+  refreshPublicButton();
 }
 
 // Where the result came from, and which aligners it could not run, so a missing row says why.
-function renderEvalMeta(d){
+function renderEvalMeta(d,prefix){
   const esc=v=>String(v==null?'':v).replace(/[&<]/g,c=>c==='&'?'&amp;':'&lt;');
   const inp=d.input||{};
   let m='Input: <b>'+esc(inp.ref)+'</b>'+(inp.revision?' @ <code>'+esc(String(inp.revision).slice(0,12))+'</code>':'')
@@ -85,7 +99,7 @@ function renderEvalMeta(d){
     +(s.provenance&&s.provenance.host?' on '+esc(s.provenance.host):'')).join(', ');
   const failed=Object.entries(st).filter(([,s])=>s.failed&&s.failed.length);
   if(failed.length) m+='<br>Clips an aligner could not align: '+failed.map(([n,s])=>esc(n)+' '+s.failed.length).join(', ');
-  $('evMeta').innerHTML=m;
+  $(prefix+'Meta').innerHTML=m;
 }
 
 $('evPick').onchange=()=>loadEvalResult($('evPick').value);
@@ -121,18 +135,19 @@ function evalLanes(id){
   }).filter(l=>l.words&&l.words.length);
 }
 
-function renderEval(d){
+function renderEval(d,prefix,interactive){
+  interactive=interactive!==false;
   const people=Object.entries(d.annotators||{}).map(([n,c])=>n+' '+c).join(', ');
-  $('evSummary').innerHTML=d.marked_clips
+  $(prefix+'Summary').innerHTML=d.marked_clips
     ? '<b>'+d.marked_clips+'</b> clips marked by '+people
       +(d.left_out&&d.left_out.length?' &middot; left out (test accounts): '+d.left_out.join(', '):'')
     : 'No marked clips yet.';
   const ranked=Object.entries(d.aligners||{}).filter(([,s])=>s.boundaries)
     .sort((a,b)=>a[1].p90_ms-b[1].p90_ms);
   if(!ranked.length){
-    $('evTable').innerHTML='<tr><td class="evEmpty">Nothing scored in this result.</td></tr>';
-    $('evBars').innerHTML=''; $('evClips').innerHTML=''; $('evLegend').textContent='';
-    $('evSig').innerHTML=''; $('evWarn').hidden=true;
+    $(prefix+'Table').innerHTML='<tr><td class="evEmpty">Nothing scored in this result.</td></tr>';
+    $(prefix+'Bars').innerHTML=''; $(prefix+'Clips').innerHTML=''; $(prefix+'Legend').textContent='';
+    $(prefix+'Sig').innerHTML=''; $(prefix+'Warn').hidden=true;
     return;
   }
   // A value with its 95% interval underneath, from resampling clips.
@@ -178,14 +193,14 @@ function renderEval(d){
       +'<td class="evEnds">'+(((h.ends||{}).within_50ms!=null)?h.ends.within_50ms+'%':'&ndash;')+'</td>'
       +(hasUnmoved?'<td></td>':'')+'</tr>';
   }
-  $('evTable').innerHTML=t;
-  renderSignificance(d);
+  $(prefix+'Table').innerHTML=t;
+  renderSignificance(d,prefix);
 
-  $('evBars').innerHTML=ranked.map(([n,s])=>'<div class="evBar"><span>'+n+'</span>'
+  $(prefix+'Bars').innerHTML=ranked.map(([n,s])=>'<div class="evBar"><span>'+n+'</span>'
     +'<div class="evTrack"><div class="evFill" style="width:'+s.within_100ms+'%"></div>'
     +(h?'<div class="evFloor" style="left:'+h.within_100ms+'%"></div>':'')+'</div>'
     +'<span>'+s.within_100ms+'%</span></div>').join('');
-  $('evLegend').textContent=h
+  $(prefix+'Legend').textContent=h
     ? 'White line: two people on the same clip agree within 100 ms on '+h.within_100ms+'% of boundaries.'
     : 'No clip has been marked by two people yet, so there is no human reference line.';
 
@@ -194,15 +209,17 @@ function renderEval(d){
     const vals=names.map(n=>c[n]).filter(v=>v!=null);
     return {id,c,worst:vals.length?Math.max(...vals):-1};
   }).sort((a,b)=>b.worst-a.worst);
-  let ct='<tr><th></th><th>clip</th><th>recording</th>'+names.map(n=>'<th>'+n+'</th>').join('')+'</tr>';
+  let ct='<tr><th></th><th>clip</th><th>clip id</th>'+names.map(n=>'<th>'+n+'</th>').join('')+'</tr>';
   clipsRows.forEach(({id,c})=>{
-    ct+='<tr class="clip" data-id="'+id+'"><td><a class="evOpen" href="?clip='+encodeURIComponent(id)
-      +'&aligners=all" title="Open this clip with every aligner shown">open &#9656;</a></td><td><span class="evText">'
-      +String(c._text||'').replace(/</g,'&lt;')+'</span></td><td>'+(c._recording||'')+'</td>'
+    ct+='<tr class="clip" data-id="'+id+'"><td>'+(interactive
+      ?'<a class="evOpen" href="?clip='+encodeURIComponent(id)
+        +'&aligners=all" title="Open this clip with every aligner shown">open &#9656;</a>':'')
+      +'</td><td><span class="evText">'
+      +String(c._text||'').replace(/</g,'&lt;')+'</span></td><td><code>'+String(id).replace(/</g,'&lt;')+'</code></td>'
       +names.map(n=>'<td class="'+errClass(c[n])+'">'+fmtMs(c[n])+'</td>').join('')+'</tr>';
   });
-  $('evClips').innerHTML=ct;
-  $('evClips').querySelectorAll('tr.clip').forEach(tr=>{
+  $(prefix+'Clips').innerHTML=ct;
+  if(interactive) $(prefix+'Clips').querySelectorAll('tr.clip').forEach(tr=>{
     tr.onclick=e=>{
       // A plain click opens in place; ctrl/cmd-click on the link opens a new tab as usual.
       if(e.target.closest('a')&&(e.ctrlKey||e.metaKey||e.shiftKey)) return;
@@ -216,8 +233,8 @@ function renderEval(d){
 
 // The seed warning and the pairwise tests. Kept apart from the main table so the numbers
 // and the question "should I believe this ranking?" read as separate things.
-function renderSignificance(d){
-  const w=$('evWarn');
+function renderSignificance(d,prefix){
+  const w=$(prefix+'Warn');
   const seed=d.seed, ss=seed&&d.aligners&&d.aligners[seed];
   if(ss && ss.unmoved_pct!=null){
     w.hidden=false;
@@ -230,7 +247,7 @@ function renderSignificance(d){
 
   const tests=d.comparisons||[];
   if(!tests.length){
-    $('evSig').innerHTML='<tr><td class="evEmpty">Needs at least two aligners scored on the same clips.</td></tr>';
+    $(prefix+'Sig').innerHTML='<tr><td class="evEmpty">Needs at least two aligners scored on the same clips.</td></tr>';
     return;
   }
   const label={p90_ms:'p90',within_50ms:'within 50 ms'};
@@ -251,7 +268,21 @@ function renderSignificance(d){
       // it does not make it zero.
       +'<td>'+(t.p_holm===0?'&lt; 0.001':t.p_holm)+'</td><td>'+verdict+'</td></tr>';
   });
-  $('evSig').innerHTML=s;
+  $(prefix+'Sig').innerHTML=s;
 }
 
-export {showEval,loadEvalResult,evalLanes,renderEval,renderSignificance};
+$('evSetPublicBtn').onclick=async()=>{
+  if(!S.evalCur) return;
+  $('evSetPublicBtn').disabled=true;
+  try{
+    const r=await fetch(api('/api/eval-results/set-public'),{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({id:S.evalCur})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){ alert('Could not set as public: '+(d.error||r.status)); return; }
+    S.evalPublicId=d.public_id;
+    refreshPublicButton();
+  }catch(e){ alert('Could not set as public: '+e); }
+  finally{ $('evSetPublicBtn').disabled=false; }
+};
+
+export {showEval,loadEvalResult,evalLanes,renderEval,renderEvalMeta,renderSignificance};

@@ -1,4 +1,4 @@
-<!doctype html><meta charset="utf-8"><title>Hebrew alignment tagging</title>
+<!doctype html><meta charset="utf-8"><title>Hebrew Forced Alignment Evaluation Results</title>
 <link rel="stylesheet" href="/static/css/app.css">
 
 <div id="waitScreen" style="display:none"><div id="waitCard">
@@ -43,16 +43,65 @@
   <div class="savedItems" id="savedItems"></div>
   <button id="savedClose">close</button>
 </div></div>
-<div class="top"><h1>Hebrew alignment tagging</h1><div id="bar"></div><div id="me"></div>
+<div class="top"><h1 id="pageTitle">Hebrew Forced Alignment Evaluation Results</h1><div id="bar"></div><div id="me"></div>
   <span id="navLinks" style="display:inline-flex;gap:12px;align-items:center">
-    <a id="overviewLink" href="#">overview</a>
-    <a id="evalLink" href="#">aligner eval</a>
+    <a id="overviewLink" href="#" style="display:none">overview</a>
+    <a id="evalLink" href="#" style="display:none">aligner eval</a>
     <a id="approveLink" href="#" style="display:none">approvals</a>
-    <a id="taggingLink" href="#" style="display:none">back to tagging</a>
+    <a id="taggingLink" href="#" style="display:none">To Tagging</a>
   </span>
   <span id="sampleBadge" style="display:none">viewing local sample</span>
   <button id="uploadSampleBtn" title="Load a local CSV + WAV pair for viewing, no server involved">upload sample</button>
   <button id="removeSampleBtn" style="display:none">remove sample</button>
+</div>
+
+<div id="publicEvalScreen">
+  <div class="ovCard" id="pubEmpty" hidden>
+    <h2>No Evaluation Results Available Yet</h2>
+    <p class="evNote" id="pubEmptyText">An administrator must upload and designate a public evaluation result.</p>
+  </div>
+  <div id="pubResults" hidden>
+    <div class="ovCard">
+      <h2>Aligner evaluation</h2>
+      <p class="evNote" id="pubSummary">Loading...</p>
+      <div class="evScroll"><table class="ev" id="pubTable"></table></div>
+      <div class="evWarn" id="pubWarn" hidden></div>
+      <details class="evDetails">
+        <summary>Run details</summary>
+        <p class="evNote" id="pubMeta"></p>
+        <p class="evNote">Results are computed offline by <code>eval-forced-alignment</code>
+          (<code>python -m efa.run --input &lt;published gold set&gt;</code>) and uploaded by an
+          administrator; this screen only displays them.</p>
+        <p class="evNote">Boundary error is how far an aligner put a word's start and end from
+          where a person marked it. <b>Rank by p90, not the median</b>: an aligner that is usually
+          close but sometimes half a second out still cuts training clips mid-word. The dashed
+          row is two people marking the same clip &mdash; an aligner inside it is already as good
+          as the humans judging it.</p>
+      </details>
+    </div>
+    <div class="ovCard">
+      <details class="evDetails">
+        <summary><h2>Is the difference real?</h2></summary>
+        <p class="evNote">Each test redraws the marked clips 2,000 times and scores both aligners on
+          the same draw, so an easy recording or a mumbling speaker cancels out instead of
+          swamping the difference. Clips are redrawn rather than single boundaries, because
+          boundaries in one clip share a speaker and a recording and are not independent. The
+          p-values are corrected for running several tests at once. <b>Grey rows could be chance;
+          mark more clips to narrow the intervals.</b></p>
+        <div class="evScroll"><table class="ev" id="pubSig"></table></div>
+      </details>
+    </div>
+    <div class="ovCard">
+      <h2>Boundaries within 100 ms</h2>
+      <div class="evBars" id="pubBars"></div>
+      <div class="evLegend" id="pubLegend"></div>
+    </div>
+    <div class="ovCard">
+      <h2>Per clip &mdash; worst first</h2>
+      <p class="evNote">Median error per aligner on each clip. Click a clip to open it.</p>
+      <div class="evScroll evClipScroll"><table class="ev" id="pubClips"></table></div>
+    </div>
+  </div>
 </div>
 
 <div id="evalScreen">
@@ -66,31 +115,38 @@
         <input type="file" id="evUpload" accept=".json,application/json" hidden>
         <button id="evUploadBtn" title="A result.json written by eval-forced-alignment">&#8593; upload result</button>
         <button id="evDeleteBtn" title="Remove this result from the site">delete</button>
+        <button id="evSetPublicBtn" title="Show this result to public visitors by default" hidden>Set as Public</button>
+        <span id="evPublicBadge" class="evPublicBadge" hidden>Current Public Result</span>
       </span>
       <a id="evDlResults" href="#" download="result.json">&#8595; download (.json)</a>
       <a id="evDlMarks" href="#" download="gold.jsonl">&#8595; current marks (.jsonl)</a>
     </div>
-    <p class="evNote" id="evMeta"></p>
-    <p class="evNote">Results are computed offline by <code>eval-forced-alignment</code>
-      (<code>python -m efa.run --input &lt;published gold set&gt;</code>) and uploaded here;
-      this screen only displays them.</p>
-    <p class="evNote">Boundary error is how far an aligner put a word's start and end from
-      where a person marked it. <b>Rank by p90, not the median</b>: an aligner that is usually
-      close but sometimes half a second out still cuts training clips mid-word. The dashed
-      row is two people marking the same clip &mdash; an aligner inside it is already as good
-      as the humans judging it.</p>
     <div class="evScroll"><table class="ev" id="evTable"></table></div>
     <div class="evWarn" id="evWarn" hidden></div>
+    <details class="evDetails">
+      <summary>Run details</summary>
+      <p class="evNote" id="evMeta"></p>
+      <p class="evNote">Results are computed offline by <code>eval-forced-alignment</code>
+        (<code>python -m efa.run --input &lt;published gold set&gt;</code>) and uploaded here;
+        this screen only displays them.</p>
+      <p class="evNote">Boundary error is how far an aligner put a word's start and end from
+        where a person marked it. <b>Rank by p90, not the median</b>: an aligner that is usually
+        close but sometimes half a second out still cuts training clips mid-word. The dashed
+        row is two people marking the same clip &mdash; an aligner inside it is already as good
+        as the humans judging it.</p>
+    </details>
   </div>
   <div class="ovCard">
-    <h2>Is the difference real?</h2>
-    <p class="evNote">Each test redraws the marked clips 2,000 times and scores both aligners on
-      the same draw, so an easy recording or a mumbling speaker cancels out instead of
-      swamping the difference. Clips are redrawn rather than single boundaries, because
-      boundaries in one clip share a speaker and a recording and are not independent. The
-      p-values are corrected for running several tests at once. <b>Grey rows could be chance;
-      mark more clips to narrow the intervals.</b></p>
-    <div class="evScroll"><table class="ev" id="evSig"></table></div>
+    <details class="evDetails">
+      <summary><h2>Is the difference real?</h2></summary>
+      <p class="evNote">Each test redraws the marked clips 2,000 times and scores both aligners on
+        the same draw, so an easy recording or a mumbling speaker cancels out instead of
+        swamping the difference. Clips are redrawn rather than single boundaries, because
+        boundaries in one clip share a speaker and a recording and are not independent. The
+        p-values are corrected for running several tests at once. <b>Grey rows could be chance;
+        mark more clips to narrow the intervals.</b></p>
+      <div class="evScroll"><table class="ev" id="evSig"></table></div>
+    </details>
   </div>
   <div class="ovCard">
     <h2>Boundaries within 100 ms</h2>
@@ -100,7 +156,7 @@
   <div class="ovCard">
     <h2>Per clip &mdash; worst first</h2>
     <p class="evNote">Median error per aligner on each clip. Click a clip to open it.</p>
-    <div class="evScroll"><table class="ev" id="evClips"></table></div>
+    <div class="evScroll evClipScroll"><table class="ev" id="evClips"></table></div>
   </div>
 </div>
 
@@ -174,7 +230,7 @@
 <div id="readOnlyBanner" style="display:none">
   <span id="readOnlyTitle">Read-only view</span>
   <span id="readOnlyClaimInfo" class="pill" style="color:#8a8f98"></span>
-  <div class="roMarksSelect">
+  <div id="roMarksWrap" class="roMarksSelect">
     <span>Marks:</span>
     <select id="roMarksSelect"></select>
   </div>

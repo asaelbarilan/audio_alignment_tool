@@ -1,13 +1,17 @@
-import {$,api,fail,setUrlParam} from '../state.js';
+import {S,$,api,fail,setUrlParam,setTitle,TAG_TITLE} from '../state.js';
 import {stop} from '../audio-engine.js';
 import {cancelAlign} from '../align-client.js';
 
 async function showApprovals(){
   stop(); cancelAlign();
+  $('publicEvalScreen').classList.remove('on');
   $('workspace').style.display='none';
   $('overviewScreen').classList.remove('on');
   $('evalScreen').classList.remove('on');
   $('approveScreen').classList.add('on');
+  $('taggingLink').style.display='';
+  S.taggingEntered=false;
+  setTitle(TAG_TITLE);
   setUrlParam('view','approvals'); setUrlParam('clip',null);
   let list=[];
   try{

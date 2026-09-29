@@ -1,11 +1,15 @@
-import {S,$,api,NAME} from '../state.js';
+import {S,$,api,NAME,setTitle,TAG_TITLE} from '../state.js';
 import {showApprovals} from './approvals.js';
 // main.js is not imported here: see the comment by its own S.load= assignment.
 
 function showWaiting(){
   $('gate').classList.remove('on');
+  $('publicEvalScreen').classList.remove('on');
+  $('overviewLink').style.display='';
+  $('evalLink').style.display='';
   $('workspace').style.display='none';
   $('waitScreen').style.display='block';
+  setTitle(TAG_TITLE);
   $('waitWho').textContent='Signed in as '+((S.ME&&S.ME.display)||'')+
     ((S.ME&&S.ME.email)?' ('+S.ME.email+')':'')+', filed under the name '+((S.ME&&S.ME.name)||'');
   $('me').innerHTML='waiting for approval'
@@ -14,6 +18,7 @@ function showWaiting(){
 
 function started(){
   $('gate').classList.remove('on');
+  $('publicEvalScreen').classList.remove('on');
   $('me').innerHTML='marking as <b>'+S.WHO+'</b>'
     +(S.ME&&S.ME.display?' &middot; '+S.ME.display:'')
     +(S.ME&&S.ME.logout_url?' &middot; <a href="'+S.ME.logout_url+'">sign out</a>':'');
@@ -26,7 +31,7 @@ function started(){
   // write is refused server-side anyway, and letting them mark for an hour before finding
   // that out would be worse than saying so up front.
   if(S.ME&&S.ME.auth&&S.ME.approved===false) return showWaiting();
-  S.load();
+  S.identified();
 }
 
 function signIn(){
@@ -84,7 +89,7 @@ function gate(authed){
     }
     S.WHO=v; localStorage.setItem('tagWho',v);
     g.classList.remove('on'); $('me').textContent='marking as '+S.WHO;
-    S.load();
+    S.identified();
   };
   // A real form, so Enter submits the way it does in every other text box, rather than
   // riding on a keydown handler.

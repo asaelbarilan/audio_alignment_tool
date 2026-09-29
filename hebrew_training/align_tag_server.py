@@ -693,6 +693,26 @@ def page_build() -> str:
     return h.hexdigest()[:8]
 
 
+_JS_IMPORT = re.compile(rb"""from\s+(['"])(\.\.?/[^'"]+)\1""")
+
+
+def stamp_js_imports(data: bytes, build: bytes) -> bytes:
+    """Every JS module here reaches its siblings through a plain relative `import`, which
+    page()'s src/href rewrite below never sees -- so main.js got a fresh, never-cached URL on
+    every change while the fifteen files it imports (and that mostly matter -- eval.js,
+    gate.js, words.js...) kept the immutable Cache-Control from whatever a browser first
+    fetched, indefinitely. Same fix, same reasoning: stamp the build into those specifiers so
+    the URL changes the instant their bytes do.
+    """
+
+    def stamped(m: "re.Match[bytes]") -> bytes:
+        quote, spec = m.group(1), m.group(2)
+        sep = b"&" if b"?" in spec else b"?"
+        return b"from " + quote + spec + sep + b"v=" + build + quote
+
+    return _JS_IMPORT.sub(stamped, data)
+
+
 def page() -> bytes:
     """Read the UI from disk on every request, so editing the page needs no restart.
 
@@ -1679,6 +1699,24 @@ class EvalResults:
         self._drop(f"{rid}.json")
         return True
 
+    def get_public_id(self) -> str | None:
+        raw = self._get("public.json")
+        if not raw:
+            return None
+        try:
+            rid = json.loads(raw).get("id")
+        except ValueError:
+            return None
+        return rid if isinstance(rid, str) and _EVAL_ID.match(rid) else None
+
+    def set_public_id(self, rid: str, setter: str | None) -> None:
+        payload = {
+            "id": rid,
+            "set_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "set_by": setter,
+        }
+        self._put("public.json", json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
 
 def check_result(result) -> str | None:
     """Why this upload is not a result the viewer can show, or None."""
@@ -1732,9 +1770,12 @@ def make_handler(args, dataset: Dataset, clips):
             if not target.is_file():
                 return self.send(404, b"not found", "text/plain")
             ctype = self._STATIC_TYPES.get(target.suffix, "application/octet-stream")
+            data = target.read_bytes()
+            if target.suffix == ".js":
+                data = stamp_js_imports(data, page_build().encode("ascii"))
             return self.send(
                 200,
-                target.read_bytes(),
+                data,
                 ctype,
                 {"Cache-Control": "public, max-age=31536000, immutable"},
             )
@@ -1880,7 +1921,13 @@ def make_handler(args, dataset: Dataset, clips):
                 return self.send(
                     503, b'{"error":"database migration required"}', "application/json"
                 )
-            if args.auth and route.startswith("/api/") and route != "/api/progress":
+            # A clip's audio and its marks are read-only and carry nothing a signed-in user
+            # could not already see for any clip in the dataset -- letting a public visitor
+            # open one from the eval table's "open" link needs no identity, same as the
+            # summary itself.
+            if args.auth and route.startswith("/api/") and route not in (
+                "/api/progress", "/api/public-eval", "/api/clip-marks",
+            ) and not route.startswith("/api/audio/"):
                 if not self.signed_in():
                     return self.send(401, b'{"error":"sign in"}', "application/json")
                 if not self.who():
@@ -1920,9 +1967,31 @@ def make_handler(args, dataset: Dataset, clips):
                 _, admin = self.standing()
                 return self.send(
                     200,
-                    json.dumps({"results": listing, "can_upload": admin or not args.auth or not admins()},
+                    json.dumps({"results": listing, "can_upload": admin or not args.auth or not admins(),
+                                "public_id": RESULTS.get_public_id()},
                                ensure_ascii=False).encode("utf-8"),
                     "application/json; charset=utf-8",
+                )
+            if route == "/api/public-eval":
+                # No sign-in and no per-result picker: a public visitor sees whatever an
+                # approver pinned, or that nothing has been pinned yet.
+                pid = RESULTS.get_public_id()
+                body = RESULTS.get(pid) if pid else None
+                if not pid or body is None:
+                    return self.send(200, b'{"has_public":false}', "application/json; charset=utf-8")
+                try:
+                    result = json.loads(body)
+                except ValueError:
+                    return self.send(200, b'{"has_public":false}', "application/json; charset=utf-8")
+                # clip_data stays in: it is what lets a public visitor open a clip from the
+                # per-clip table (evalLanes() reads it), and /api/audio + /api/clip-marks
+                # serve it to anyone regardless.
+                return self.send(
+                    200,
+                    json.dumps({"has_public": True, "id": pid, "result": result},
+                               ensure_ascii=False).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                    {"Cache-Control": "public, max-age=60"},
                 )
             if route.startswith("/api/eval-results/"):
                 body = RESULTS.get(route.rsplit("/", 1)[1])
@@ -2310,6 +2379,26 @@ def make_handler(args, dataset: Dataset, clips):
                                      "application/json")
                 return self.send(200, json.dumps(entry, ensure_ascii=False).encode("utf-8"),
                                  "application/json; charset=utf-8")
+            if route == "/api/eval-results/set-public":
+                # Same standing as publishing a result: everyone who can sign in can read the
+                # public pointer, only an approver can move it.
+                _, admin = self.standing()
+                if args.auth and admins() and not admin:
+                    return self.send(403, b'{"error":"only approvers can set the public result"}',
+                                     "application/json")
+                length = int(self.headers.get("Content-Length", 0))
+                try:
+                    body = json.loads(self.rfile.read(length).decode("utf-8"))
+                except ValueError as exc:
+                    return self.send(400, json.dumps({"error": f"not JSON: {exc}"}).encode("utf-8"),
+                                     "application/json")
+                rid = str(body.get("id", ""))
+                if RESULTS.get(rid) is None:
+                    return self.send(404, b'{"error":"no such result"}', "application/json")
+                person = self.signed_in() or {}
+                RESULTS.set_public_id(rid, person.get("email") or self.who())
+                return self.send(200, json.dumps({"ok": True, "public_id": rid}).encode("utf-8"),
+                                 "application/json")
             if route == "/api/approve":
                 approved, admin = self.standing()
                 if not admin:

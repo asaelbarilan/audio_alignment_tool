@@ -1,16 +1,19 @@
-import {S,$,api,mmss,setUrlParam} from '../state.js';
+import {S,$,api,mmss,setUrlParam,setTitle,TAG_TITLE} from '../state.js';
 import {stop} from '../audio-engine.js';
 import {cancelAlign} from '../align-client.js';
 // main.js is not imported here: see the comment by its own S.openClip= assignment.
 
 async function showOverview(){
   stop(); cancelAlign();
+  $('publicEvalScreen').classList.remove('on');
   $('evalScreen').classList.remove('on');
   $('evalLink').classList.remove('cur');
   $('workspace').style.display='none';
   $('overviewScreen').classList.add('on');
   $('overviewLink').classList.add('cur');
   $('taggingLink').style.display='';
+  S.taggingEntered=false;
+  setTitle(TAG_TITLE);
   setUrlParam('view','overview');
   setUrlParam('clip',null);
   await loadOverview();

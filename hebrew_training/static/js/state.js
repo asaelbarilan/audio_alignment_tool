@@ -21,7 +21,8 @@ const S={
   snapShow: localStorage.getItem('tagSnapShow')==='1',
   view:null,
   ME:null, isReadOnly:false, currentClipDetail:null, overviewData:null,
-  evalList:[], evalCur:null, evalData:null,
+  taggingEntered:false,
+  evalList:[], evalCur:null, evalData:null, evalPublicId:null,
   alnShown:new Set(), alnSig:null,
   // Opened from the eval dashboard: show every aligner, since comparing them is why you came.
   alnForceAll:(new URLSearchParams(location.search).get('aligners')==='all'),
@@ -91,6 +92,17 @@ addEventListener('unhandledrejection',e=>{
   fail('The page hit an error: '+((r&&r.message)||r));
 });
 
+// The page reads as two different apps depending on what's on screen -- the eval viewer
+// (public or admin) and the actual tagging workspace/overview/approvals -- so the heading
+// and tab title switch with it instead of one static string claiming to be both.
+const EVAL_TITLE='Hebrew Forced Alignment Evaluation Results';
+const TAG_TITLE='Hebrew alignment tagging';
+function setTitle(t){
+  document.title=t;
+  const h=$('pageTitle');
+  if(h) h.textContent=t;
+}
+
 const f3=t=>t.toFixed(3);
 const mmss=t=>{t=Math.max(0,t);return Math.floor(t/60)+':'+(t%60).toFixed(2).padStart(5,'0');};
 
@@ -103,4 +115,4 @@ function setUrlParam(key, val){
   history.pushState(null,'',u.pathname+u.search);
 }
 
-export {PARAMS,TOK,S,api,$,fail,BUILD,checkBuild,f3,mmss,NAME,setUrlParam};
+export {PARAMS,TOK,S,api,$,fail,BUILD,checkBuild,f3,mmss,NAME,setUrlParam,setTitle,EVAL_TITLE,TAG_TITLE};

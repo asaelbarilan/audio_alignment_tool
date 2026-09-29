@@ -25,11 +25,16 @@ function clipLabels(){
 // Rebuilt only when the set of aligners changes, so it can be called from draw() cheaply.
 function renderAlnToggles(){
   const labels=clipLabels();
-  const sig=labels.map(l=>l.source).join('|');
+  // isReadOnly rides along in the cache key -- "switch to edit mode" keeps the same clip and
+  // the same aligners, so the label signature alone would miss that the playback picker
+  // needs to disappear.
+  const sig=(S.isReadOnly?'ro':'rw')+'|'+labels.map(l=>l.source).join('|');
   if(sig===S.alnSig) return;
   S.alnSig=sig;
   if(S.alnForceAll){ labels.forEach(l=>S.alnShown.add(l.source)); S.alnForceAll=false; saveAln(); }
-  $('alnBar').hidden=!labels.length;
+  // Comparing against other aligners is a read-only/eval thing -- while actively tagging your
+  // own marks are what you're producing, so there is nothing here to compare against.
+  $('alnBar').hidden=!S.isReadOnly||!labels.length;
   $('alnToggles').innerHTML=labels.map((l,i)=>'<label class="alnT"><input type="checkbox" data-src="'
     +l.source+'"'+(S.alnShown.has(l.source)?' checked':'')+'><i class="alnSw" style="background:'
     +alnColor(l.source,i)+'"></i>'+l.source+'</label>').join('');
@@ -45,7 +50,8 @@ function setAllAln(on){
 
 // The "playback uses" dropdown: golden marks by default, or any aligner lane, so a model's
 // own timings can actually be listened to and stepped through instead of read off the
-// picture only. Rebuilt alongside the toggles since it lists the same aligners.
+// picture only. Rebuilt alongside the toggles since it lists the same aligners. #alnBar
+// (above) is hidden outside read-only, so this never renders while actively tagging.
 function renderAlnMainSelect(labels){
   const sel=$('alnMainSelect');
   if(!sel) return;
@@ -86,6 +92,10 @@ function setMainAln(source){
 
 // Paint the enabled lanes into the band [y0, y1) of a canvas, using its own time->x map.
 function paintAlnLanes(g,X,y0,y1,w,withNames){
+  // Same read-only gate as the toggles that turn these on -- without it, a lane enabled in a
+  // past read-only view (S.alnShown persists across clips via localStorage) would keep
+  // painting here with no visible control left to turn it back off.
+  if(!S.isReadOnly) return;
   const lanes=clipLabels().map((l,i)=>({l,i})).filter(o=>S.alnShown.has(o.l.source));
   if(!lanes.length) return;
   const laneH=(y1-y0)/lanes.length;

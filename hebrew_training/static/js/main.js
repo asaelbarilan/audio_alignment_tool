@@ -1,4 +1,4 @@
-import {S,$,PARAMS,api,fail,checkBuild,mmss,setUrlParam} from './state.js';
+import {S,$,PARAMS,api,fail,checkBuild,mmss,setUrlParam,setTitle,TAG_TITLE} from './state.js';
 import {total,tmin,mark,now,stop,start,setLoop,toggle,moveHead,
   playWord,playBefore,playAfter,stretched,setRate} from './audio-engine.js';
 import {fitWord,draw,setAllAln} from './canvas-draw.js';
@@ -10,9 +10,19 @@ import {cancelAlign} from './align-client.js';
 import {showOverview,claimClip} from './screens/overview.js';
 import {showEval,evalLanes} from './screens/eval.js';
 import {showApprovals} from './screens/approvals.js';
+import {showPublicEval} from './screens/public-eval.js';
 import {showWaiting,started,signIn,showMigrate,gate} from './screens/gate.js';
 
 const NAME=/^[A-Za-z0-9_-]{1,32}$/;
+
+// The actual marking workspace, as opposed to looking at it: switches the title back to the
+// tagging app and remembers that the workspace -- not an eval/overview screen -- is what a
+// bare popstate (no view/clip in the URL) should return to.
+function enterWorkspace(){
+  S.taggingEntered=true;
+  $('publicEvalScreen').classList.remove('on');
+  setTitle(TAG_TITLE);
+}
 
 async function openClip(key, forceReadOnly, extraLanes){
   stop(); cancelAlign();
@@ -46,44 +56,36 @@ async function openClip(key, forceReadOnly, extraLanes){
   $('workspace').style.display='block';
   $('overviewLink').classList.remove('cur');
   $('taggingLink').style.display='';
+  enterWorkspace();
   setUrlParam('clip', key);
   setUrlParam('view', null);
 
+  let evalRefAnn=null;
   if(S.isReadOnly){
     $('readOnlyBanner').style.display='flex';
     const select=$('roMarksSelect');
     select.innerHTML='';
 
     if(evalMode&&evalHuman&&Object.keys(evalHuman).length){
-      $('readOnlyClaimInfo').textContent='Eval result'+(S.evalData.title?': '+S.evalData.title:'')
-        +' &middot; golden (human) marks';
-      const humanKeys=Object.keys(evalHuman).sort();
-      humanKeys.forEach(ann=>{
-        const opt=document.createElement('option');
-        opt.value=ann;
-        opt.textContent=ann+' (golden)';
-        select.appendChild(opt);
-      });
-      select.value=humanKeys[0];
-      select.onchange=()=>{
-        const wordsToUse=evalHuman[select.value]||[];
-        S.alnMain=null; S.alnMainGolden=null;  // switching the golden pick drops any aligner override
-        S.gold=wordsToUse.map(w=>({word:w.word,start:w.start,end:w.end,was:w.was,added:w.added}));
-        S.touched=new Set();
-        buildWords();
-        draw();
-        render();
-      };
+      // The gold reference the eval set actually scored the aligners against -- not a
+      // choice: same tie-break evalLanes() uses when several people marked one clip.
+      evalRefAnn=Object.keys(evalHuman).sort()[0];
+      $('readOnlyTitle').textContent='Eval preview · read-only';
+      $('readOnlyClaimInfo').style.display='none';
+      $('roMarksWrap').style.display='none';
       // Claiming or saving from an eval view would write to the live dataset while
       // looking at a frozen result -- neither belongs here, so both stay hidden rather
       // than merely disabled.
       $('roClaimBtn').style.display='none';
     }else{
+      $('readOnlyTitle').textContent='Read-only view';
+      $('roMarksWrap').style.display='';
       let claimText='Unclaimed';
       if(data.claim&&data.claim.claimant){
         claimText='Claimed by '+(data.claim.claimed_by_me?'you':data.claim.claimant)
           +(data.claim.done?' (done)':'');
       }
+      $('readOnlyClaimInfo').style.display='';
       $('readOnlyClaimInfo').textContent=claimText;
 
       const baseOpt=document.createElement('option');
@@ -121,7 +123,10 @@ async function openClip(key, forceReadOnly, extraLanes){
         render();
       };
 
-      if(data.claim&&data.claim.claimable){
+      // Claiming from an eval preview would write to the live dataset while looking at a
+      // frozen result -- same reasoning as the golden-marks branch above, just reached when
+      // this eval clip's data has no golden marks of its own to fall back to instead.
+      if(!evalMode&&data.claim&&data.claim.claimable){
         $('roClaimBtn').style.display='';
         $('roClaimBtn').onclick=()=>claimClip(key);
       }else{
@@ -136,7 +141,11 @@ async function openClip(key, forceReadOnly, extraLanes){
       $('roEditBtn').style.display='none';
     }
 
-    $('roBackOvBtn').onclick=evalMode?showEval:showOverview;
+    // A public visitor previewing a clip from the eval table has no admin evalScreen to
+    // return to -- and no /api/eval-results access to rebuild it from -- so "back" has to
+    // mean the public viewer instead.
+    $('roBackOvBtn').textContent=evalMode?'Back to eval results':'Back to overview';
+    $('roBackOvBtn').onclick=evalMode?(isPublicVisitor()?showPublicEval:showEval):showOverview;
     setClipActionsVisible(false);
   }else{
     $('readOnlyBanner').style.display='none';
@@ -146,7 +155,7 @@ async function openClip(key, forceReadOnly, extraLanes){
   let existingIndex=S.clips.findIndex(x=>(x.key||x.id)===key);
   let initialSaved=null;
   if(evalMode&&evalHuman&&Object.keys(evalHuman).length){
-    initialSaved=evalHuman[$('roMarksSelect').value];
+    initialSaved=evalHuman[evalRefAnn];
   }else if(S.isReadOnly){
     const choice=$('roMarksSelect').value;
     if(choice!=='__baseline__'&&data.marks&&data.marks[choice]){
@@ -197,6 +206,25 @@ async function backToTagging(){
   await load();
 }
 
+// True only when a real sign-in wall (--auth/--local-auth) is up and nobody has crossed it.
+// Nothing else counts as "public" -- a locally-run server with no --auth at all has no wall
+// to begin with, so its only visitor is whoever the name gate identifies, and they get the
+// tagger/admin surface like anyone signed in.
+function isPublicVisitor(){
+  return Boolean(S.ME && S.ME.auth && !S.ME.logged_in);
+}
+
+// A public visitor's only legitimate way to open a specific clip: it has to be one of the
+// current public eval result's own clips, previewed read-only exactly as clicking it from the
+// per-clip table would. Reached from a reload or bookmark of a link that table produced (see
+// showPublicEval()'s setUrlParam('result',...)) -- never from a bare, unqualified clip id.
+async function openPublicClip(key){
+  await showPublicEval();
+  const lanes=S.evalData?evalLanes(key):null;
+  if(!lanes) return signIn();
+  return openClip(key, false, lanes);
+}
+
 async function boot(){
   if(await checkBuild()) return;   // an old copy; the reload is already on its way
   let r;
@@ -206,8 +234,18 @@ async function boot(){
   try{ S.ME=await r.json(); }
   catch(e){ return fail('The server sent something unreadable instead of your account.'); }
   if(S.ME.migrate) return showMigrate();
+  if(isPublicVisitor()){
+    // Nobody's identity, clips or claims are fetched for a visitor who hasn't signed in.
+    // "To Tagging", or a deep link into one of these screens, is what asks them to. A
+    // ?clip=...&result=... link is the one exception -- it is how a clip opened from the
+    // public eval table survives a reload or a bookmark.
+    const v=PARAMS.get('view');
+    const cl=PARAMS.get('clip');
+    if(v==='overview' || v==='eval' || v==='approvals') return signIn();
+    if(cl) return PARAMS.get('result') ? openPublicClip(cl) : signIn();
+    return showPublicEval();
+  }
   if(S.ME.auth){
-    if(!S.ME.logged_in) return signIn();
     // Signed in but no annotator name yet. The marks made before sign-in existed are filed
     // under short names, so the first login gets to claim one rather than orphan the work.
     if(!S.ME.name) return gate(true);
@@ -216,7 +254,20 @@ async function boot(){
   const meta=await (await fetch(api('/api/meta'))).json();
   if(meta.multi && !NAME.test(S.WHO)) return gate(false);
   if(meta.multi) $('me').textContent='marking as '+S.WHO;
-  return load();
+  return identified();
+}
+
+// Reached once someone is identified -- signed in, or named through the local gate -- but
+// before they've asked for the tagging workspace itself. Their landing is the same eval
+// screen a public visitor sees, just with an admin's controls where standing allows them;
+// a deep link straight into one of the tagging screens skips it.
+async function identified(){
+  $('overviewLink').style.display='';
+  $('evalLink').style.display='';
+  const v=PARAMS.get('view');
+  if(v==='overview' || v==='eval' || v==='approvals' || PARAMS.get('clip')) return load();
+  S.taggingEntered=false;
+  return showEval();
 }
 
 async function load(){
@@ -274,6 +325,7 @@ async function loadClip(){
   stop();
   const c=S.clips[S.ci];
   if(!c) return;
+  enterWorkspace();
   S.gold=(c.saved||c.words).map(w=>({word:w.word,start:w.start,end:w.end,was:w.was,added:w.added}));
   S.touched=new Set(c.saved?S.gold.map((_,i)=>i):[]);
   S.alnMain=null; S.alnMainGolden=null;  // a new clip starts back on its own golden marks
@@ -361,6 +413,15 @@ async function tryLoadSample(){
     S.ctx=S.ctx||new (window.AudioContext||window.webkitAudioContext)();
     const decoded=await S.ctx.decodeAudioData(S.sampleWav.buf.slice(0));
     stop();
+    // A client-only preview, open to a public visitor too -- nothing here touches the
+    // server, so it doesn't wait for identification. But it draws into #workspace, which
+    // the public/eval landing hid, so bring it to the front the same way entering the
+    // real workspace would.
+    $('publicEvalScreen').classList.remove('on');
+    $('evalScreen').classList.remove('on'); $('evalLink').classList.remove('cur');
+    $('overviewScreen').classList.remove('on'); $('overviewLink').classList.remove('cur');
+    $('workspace').style.display='block';
+    setTitle(TAG_TITLE);
     S.sampleMode=true;
     S.sampleBaseline=words.map(w=>({...w}));
     S.gold=words.map(w=>({...w})); S.touched=new Set();
@@ -575,15 +636,25 @@ $('overviewLink').onclick=e=>{ e.preventDefault(); showOverview(); };
 $('alnAll').onclick=()=>setAllAln(true);
 $('alnNone').onclick=()=>setAllAln(false);
 $('evalLink').onclick=e=>{ e.preventDefault(); showEval(); };
-$('taggingLink').onclick=e=>{ e.preventDefault(); backToTagging(); };
+$('taggingLink').onclick=e=>{
+  e.preventDefault();
+  return isPublicVisitor() ? signIn() : backToTagging();
+};
 addEventListener('popstate',()=>{
   const p=new URLSearchParams(location.search);
   const v=p.get('view');
   const c=p.get('clip');
   if(v==='overview') showOverview();
   else if(v==='eval') showEval();
-  else if(c) openClip(c);
-  else backToTagging();
+  else if(c){
+    // Same "was this reached from an eval result" check boot() makes on a fresh load, just
+    // for navigating back/forward within one session instead of reloading the page.
+    if(isPublicVisitor()) openPublicClip(c);
+    else openClip(c, false, p.get('result')?evalLanes(c):null);
+  }
+  else if(S.taggingEntered) backToTagging();
+  else if(isPublicVisitor()) showPublicEval();
+  else showEval();
 });
 
 // words.js and the screen modules need these too, but importing this file from there
@@ -592,5 +663,6 @@ addEventListener('popstate',()=>{
 // mid-way through the circular chain, before audio-engine.js has finished defining what
 // this file's own top imports. Routing through S sidesteps the import entirely.
 S.openClip=openClip; S.backToTagging=backToTagging; S.load=load; S.loadClip=loadClip; S.showSaved=showSaved;
+S.identified=identified;
 
 boot().catch(e=>fail('The page could not start: '+(e&&e.message||e)));

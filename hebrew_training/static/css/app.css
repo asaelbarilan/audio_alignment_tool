@@ -138,12 +138,24 @@
   #overviewLink:hover, #taggingLink:hover{text-decoration:underline;color:#8cb7ff}
   #overviewLink.cur{color:#fff;font-weight:bold;text-decoration:underline}
   #evalLink.cur{color:#fff;font-weight:bold;text-decoration:underline}
-  #evalScreen{display:none;margin-top:14px;max-width:1100px}
+  #publicEvalScreen{display:none;margin:14px auto 0;max-width:1100px}
+  #publicEvalScreen.on{display:block}
+  #evalScreen{display:none;margin:14px auto 0;max-width:1100px}
   #evalScreen.on{display:block}
-  #evalScreen .ovCard{margin-bottom:16px}
-  #evalScreen h2{font-size:16px;margin:0 0 6px}
+  .evPublicBadge{color:#4ec98a;font-weight:600;font-size:12.5px}
+  #evalScreen .ovCard,#publicEvalScreen .ovCard{margin-bottom:16px}
+  #evalScreen h2,#publicEvalScreen h2{font-size:16px;margin:0 0 6px}
   .evNote{color:#8a8f98;font-size:12.5px;line-height:1.55;margin:0 0 12px}
   .evScroll{overflow-x:auto}
+  .evClipScroll{max-height:100vh;overflow-y:auto}
+  .evClipScroll th{position:sticky;top:0;background:#1c1f25;z-index:1}
+  .evDetails{margin-top:14px;border-top:1px solid #2a2e37;padding-top:10px}
+  .evDetails summary{cursor:pointer;color:#8a8f98;font-size:12.5px;font-weight:500;
+                      list-style-position:outside;user-select:none}
+  .evDetails summary:hover{color:#c8ccd4}
+  .evDetails summary h2{display:inline;font-size:16px;margin:0;color:#e8e8ea;vertical-align:middle}
+  .evDetails[open] summary{margin-bottom:10px}
+  .evDetails > p:last-child{margin-bottom:0}
   table.ev{border-collapse:collapse;width:100%;font-size:13px}
   table.ev th{color:#8a8f98;font-weight:500;text-align:right;padding:7px 10px;
               border-bottom:1px solid #2a2e37;white-space:nowrap}
