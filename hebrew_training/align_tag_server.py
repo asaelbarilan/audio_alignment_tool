@@ -361,6 +361,7 @@ def s3_client():
     if _S3 is not None:
         return _S3
     import boto3
+    from botocore.config import Config
 
     _S3 = boto3.client(
         "s3",
@@ -368,6 +369,7 @@ def s3_client():
         region_name=os.environ.get("S3_REGION", "us-east-1"),
         aws_access_key_id=os.environ["S3_ACCESS_KEY_ID"],
         aws_secret_access_key=os.environ["S3_SECRET_ACCESS_KEY"],
+        config=Config(s3={"addressing_style": "path"}),
     )
     return _S3
 
@@ -1638,7 +1640,17 @@ class EvalResults:
             try:
                 return s3_client().get_object(Bucket=self.bucket, Key=EVAL_PREFIX + name)["Body"].read()
             except Exception as exc:  # noqa: BLE001
-                if "NoSuchKey" in type(exc).__name__ or "NoSuchKey" in str(exc) or "404" in str(exc):
+                err_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+                err_msg = getattr(exc, "response", {}).get("Error", {}).get("Message", "")
+                status = getattr(exc, "response", {}).get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if (
+                    "NoSuchKey" in type(exc).__name__
+                    or "NoSuchKey" in str(exc)
+                    or "404" in str(exc)
+                    or err_code in ("NoSuchKey", "NotFound", "AccessDenied")
+                    or status in (404, 403)
+                    or "Cannot access bucket" in err_msg
+                ):
                     return None
                 raise
         f = self.folder / name
@@ -1961,6 +1973,7 @@ def make_handler(args, dataset: Dataset, clips):
             if route == "/api/eval-results":
                 try:
                     listing = RESULTS.index()
+                    public_id = RESULTS.get_public_id()
                 except Exception as exc:  # noqa: BLE001
                     return self.send(502, json.dumps({"error": f"{type(exc).__name__}: {exc}"}).encode("utf-8"),
                                      "application/json")
@@ -1968,15 +1981,18 @@ def make_handler(args, dataset: Dataset, clips):
                 return self.send(
                     200,
                     json.dumps({"results": listing, "can_upload": admin or not args.auth or not admins(),
-                                "public_id": RESULTS.get_public_id()},
+                                "public_id": public_id},
                                ensure_ascii=False).encode("utf-8"),
                     "application/json; charset=utf-8",
                 )
             if route == "/api/public-eval":
                 # No sign-in and no per-result picker: a public visitor sees whatever an
                 # approver pinned, or that nothing has been pinned yet.
-                pid = RESULTS.get_public_id()
-                body = RESULTS.get(pid) if pid else None
+                try:
+                    pid = RESULTS.get_public_id()
+                    body = RESULTS.get(pid) if pid else None
+                except Exception:
+                    pid, body = None, None
                 if not pid or body is None:
                     return self.send(200, b'{"has_public":false}', "application/json; charset=utf-8")
                 try:
