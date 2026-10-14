@@ -1,8 +1,9 @@
-import {S,$,api,fail,setUrlParam,setTitle,TAG_TITLE} from '../state.js';
+import {S,$,api,fail,setUrlParam,setTitle,TAG_TITLE,hideLoading} from '../state.js';
 import {stop} from '../audio-engine.js';
 import {cancelAlign} from '../align-client.js';
 
 async function showApprovals(){
+  hideLoading();
   stop(); cancelAlign();
   $('publicEvalScreen').classList.remove('on');
   $('workspace').style.display='none';

@@ -47,7 +47,13 @@ function api(path){
 // Nothing in this page used to say when it broke. boot() is fired and forgotten, so a
 // single failed fetch left a half-drawn screen and no message -- indistinguishable, from
 // the outside, from a page that is merely slow. Every error now names itself on screen.
+function hideLoading(){
+  const el=$('appLoading');
+  if(el) el.style.display='none';
+}
+
 function fail(msg){
+  hideLoading();
   let b=$('pageErr');
   if(!b){
     b=document.createElement('div');
@@ -115,4 +121,4 @@ function setUrlParam(key, val){
   history.pushState(null,'',u.pathname+u.search);
 }
 
-export {PARAMS,TOK,S,api,$,fail,BUILD,checkBuild,f3,mmss,NAME,setUrlParam,setTitle,EVAL_TITLE,TAG_TITLE};
+export {PARAMS,TOK,S,api,$,fail,hideLoading,BUILD,checkBuild,f3,mmss,NAME,setUrlParam,setTitle,EVAL_TITLE,TAG_TITLE};

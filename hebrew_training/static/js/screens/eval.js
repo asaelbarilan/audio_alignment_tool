@@ -1,4 +1,4 @@
-import {S,$,api,setUrlParam,setTitle,EVAL_TITLE} from '../state.js';
+import {S,$,api,setUrlParam,setTitle,EVAL_TITLE,hideLoading} from '../state.js';
 import {stop} from '../audio-engine.js';
 import {cancelAlign} from '../align-client.js';
 // main.js is not imported here: see the comment by its own S.openClip= assignment.
@@ -16,6 +16,7 @@ const fmtMs=v=>(v==null?'&ndash;':Math.round(v)+' ms');
 const errClass=v=>v==null?'':(v<=50?'evGood':(v<=100?'evMid':'evBad'));
 
 async function showEval(pick){
+  hideLoading();
   stop(); cancelAlign();
   $('publicEvalScreen').classList.remove('on');
   $('workspace').style.display='none';

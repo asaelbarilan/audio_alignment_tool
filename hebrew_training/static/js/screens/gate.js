@@ -1,8 +1,9 @@
-import {S,$,api,NAME,setTitle,TAG_TITLE} from '../state.js';
+import {S,$,api,NAME,setTitle,TAG_TITLE,hideLoading} from '../state.js';
 import {showApprovals} from './approvals.js';
 // main.js is not imported here: see the comment by its own S.load= assignment.
 
 function showWaiting(){
+  hideLoading();
   $('gate').classList.remove('on');
   $('publicEvalScreen').classList.remove('on');
   $('overviewLink').style.display='';
@@ -35,6 +36,7 @@ function started(){
 }
 
 function signIn(){
+  hideLoading();
   const g=$('gate'); g.classList.add('on');
   $('whoform').hidden=true;
   $('gatetext').textContent='Sign in so your marks are yours: nobody else can save under '
@@ -47,6 +49,7 @@ function signIn(){
 }
 
 function showMigrate(){
+  hideLoading();
   const g=$('mgate'); g.classList.add('on');
   $('miggo').onclick=async ()=>{
     const b=$('miggo'); b.disabled=true; $('migerr').textContent='';
@@ -64,6 +67,7 @@ function showMigrate(){
 }
 
 function gate(authed){
+  hideLoading();
   const g=$('gate'); g.classList.add('on');
   $('gsignin').hidden=true; $('whoform').hidden=false;
   if(authed){

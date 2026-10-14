@@ -55,6 +55,11 @@
   <button id="removeSampleBtn" style="display:none">remove sample</button>
 </div>
 
+<div id="appLoading">
+  <div class="appSpinner"></div>
+  <span>Loading...</span>
+</div>
+
 <div id="publicEvalScreen">
   <div class="ovCard" id="pubEmpty" hidden>
     <h2>No Evaluation Results Available Yet</h2>
@@ -226,7 +231,7 @@
   </div>
 </div>
 
-<div id="workspace">
+<div id="workspace" style="display:none">
 <div id="readOnlyBanner" style="display:none">
   <span id="readOnlyTitle">Read-only view</span>
   <span id="readOnlyClaimInfo" class="pill" style="color:#8a8f98"></span>

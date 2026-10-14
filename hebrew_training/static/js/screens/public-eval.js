@@ -1,4 +1,4 @@
-import {S,$,api,setUrlParam,setTitle,EVAL_TITLE} from '../state.js';
+import {S,$,api,setUrlParam,setTitle,EVAL_TITLE,hideLoading} from '../state.js';
 import {renderEvalMeta,renderEval} from './eval.js';
 
 // The public landing view: no sign-in, no clip picker, just whatever an approver pinned via
@@ -23,16 +23,19 @@ async function showPublicEval(){
   try{
     const r=await fetch(api('/api/public-eval'));
     if(!r.ok){
+      hideLoading();
       $('pubEmpty').hidden=false; $('pubEmptyText').textContent='Could not load results ('+r.status+').';
       setUrlParam('result',null);
       return;
     }
     d=await r.json();
   }catch(e){
+    hideLoading();
     $('pubEmpty').hidden=false; $('pubEmptyText').textContent='Could not reach the server.';
     setUrlParam('result',null);
     return;
   }
+  hideLoading();
   if(!d.has_public){
     $('pubEmpty').hidden=false;
     $('pubEmptyText').textContent='An administrator must upload and designate a public evaluation result.';

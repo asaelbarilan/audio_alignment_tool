@@ -1,9 +1,10 @@
-import {S,$,api,mmss,setUrlParam,setTitle,TAG_TITLE} from '../state.js';
+import {S,$,api,mmss,setUrlParam,setTitle,TAG_TITLE,hideLoading} from '../state.js';
 import {stop} from '../audio-engine.js';
 import {cancelAlign} from '../align-client.js';
 // main.js is not imported here: see the comment by its own S.openClip= assignment.
 
 async function showOverview(){
+  hideLoading();
   stop(); cancelAlign();
   $('publicEvalScreen').classList.remove('on');
   $('evalScreen').classList.remove('on');

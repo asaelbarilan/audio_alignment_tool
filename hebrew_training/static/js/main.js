@@ -1,4 +1,4 @@
-import {S,$,PARAMS,api,fail,checkBuild,mmss,setUrlParam,setTitle,TAG_TITLE} from './state.js';
+import {S,$,PARAMS,api,fail,checkBuild,mmss,setUrlParam,setTitle,TAG_TITLE,hideLoading} from './state.js';
 import {total,tmin,mark,now,stop,start,setLoop,toggle,moveHead,
   playWord,playBefore,playAfter,stretched,setRate} from './audio-engine.js';
 import {fitWord,draw,setAllAln} from './canvas-draw.js';
@@ -19,6 +19,7 @@ const NAME=/^[A-Za-z0-9_-]{1,32}$/;
 // tagging app and remembers that the workspace -- not an eval/overview screen -- is what a
 // bare popstate (no view/clip in the URL) should return to.
 function enterWorkspace(){
+  hideLoading();
   S.taggingEntered=true;
   $('publicEvalScreen').classList.remove('on');
   setTitle(TAG_TITLE);
