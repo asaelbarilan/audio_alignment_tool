@@ -32,6 +32,7 @@ import base64
 import http.client
 import io
 import hashlib
+import gzip
 import json
 import os
 import re
@@ -1631,6 +1632,10 @@ class EvalResults:
         self.bucket = bucket
         self.folder = folder
         self.lock = threading.Lock()
+        self._cache: dict[str, bytes] = {}
+        self._index_cache: list[dict] | None = None
+        self._public_id_cache: str | None = None
+        self._public_payload_cache: bytes | None = None
 
     def where(self) -> str:
         return f"s3://{self.bucket}/{EVAL_PREFIX}" if self.bucket else str(self.folder)
@@ -1657,6 +1662,7 @@ class EvalResults:
         return f.read_bytes() if f.exists() else None
 
     def _put(self, name: str, body: bytes) -> None:
+        self._cache[name] = body
         if self.bucket:
             s3_client().put_object(Bucket=self.bucket, Key=EVAL_PREFIX + name, Body=body,
                                    ContentType="application/json")
@@ -1665,17 +1671,34 @@ class EvalResults:
             (self.folder / name).write_bytes(body)
 
     def _drop(self, name: str) -> None:
+        self._cache.pop(name, None)
         if self.bucket:
             s3_client().delete_object(Bucket=self.bucket, Key=EVAL_PREFIX + name)
         else:
             (self.folder / name).unlink(missing_ok=True)
 
     def index(self) -> list[dict]:
+        with self.lock:
+            if self._index_cache is not None:
+                return self._index_cache
         raw = self._get("index.json")
-        return json.loads(raw) if raw else []
+        res = json.loads(raw) if raw else []
+        with self.lock:
+            self._index_cache = res
+        return res
 
     def get(self, rid: str) -> bytes | None:
-        return self._get(f"{rid}.json") if _EVAL_ID.match(rid) else None
+        if not _EVAL_ID.match(rid):
+            return None
+        name = f"{rid}.json"
+        with self.lock:
+            if name in self._cache:
+                return self._cache[name]
+        data = self._get(name)
+        if data is not None:
+            with self.lock:
+                self._cache[name] = data
+        return data
 
     def add(self, result: dict, body: bytes, uploader: str | None) -> dict:
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
@@ -1694,6 +1717,9 @@ class EvalResults:
         }
         self._put(f"{rid}.json", body)
         with self.lock:
+            self._index_cache = None
+            if self._public_id_cache == rid:
+                self._public_payload_cache = None
             idx = [e for e in self.index() if e.get("id") != rid]
             idx.insert(0, entry)
             self._put("index.json", json.dumps(idx, ensure_ascii=False).encode("utf-8"))
@@ -1703,6 +1729,10 @@ class EvalResults:
         if not _EVAL_ID.match(rid):
             return False
         with self.lock:
+            self._index_cache = None
+            if self._public_id_cache == rid:
+                self._public_id_cache = None
+                self._public_payload_cache = None
             idx = self.index()
             kept = [e for e in idx if e.get("id") != rid]
             if len(kept) == len(idx):
@@ -1712,6 +1742,9 @@ class EvalResults:
         return True
 
     def get_public_id(self) -> str | None:
+        with self.lock:
+            if self._public_id_cache is not None:
+                return self._public_id_cache
         raw = self._get("public.json")
         if not raw:
             return None
@@ -1719,7 +1752,11 @@ class EvalResults:
             rid = json.loads(raw).get("id")
         except ValueError:
             return None
-        return rid if isinstance(rid, str) and _EVAL_ID.match(rid) else None
+        valid_rid = rid if isinstance(rid, str) and _EVAL_ID.match(rid) else None
+        if valid_rid:
+            with self.lock:
+                self._public_id_cache = valid_rid
+        return valid_rid
 
     def set_public_id(self, rid: str, setter: str | None) -> None:
         payload = {
@@ -1728,6 +1765,31 @@ class EvalResults:
             "set_by": setter,
         }
         self._put("public.json", json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        with self.lock:
+            self._public_id_cache = rid
+            self._public_payload_cache = None
+
+    def get_public_payload(self) -> bytes:
+        with self.lock:
+            if self._public_payload_cache is not None:
+                return self._public_payload_cache
+        try:
+            pid = self.get_public_id()
+            body = self.get(pid) if pid else None
+        except Exception:
+            pid, body = None, None
+        if not pid or body is None:
+            payload = b'{"has_public":false}'
+        else:
+            try:
+                result = json.loads(body)
+                payload = json.dumps({"has_public": True, "id": pid, "result": result},
+                                     ensure_ascii=False).encode("utf-8")
+            except ValueError:
+                payload = b'{"has_public":false}'
+        with self.lock:
+            self._public_payload_cache = payload
+        return payload
 
 
 def check_result(result) -> str | None:
@@ -1752,10 +1814,14 @@ def make_handler(args, dataset: Dataset, clips):
             pass
 
         def send(self, code, body, ctype, extra=None):
+            extra = dict(extra or {})
+            if len(body) > 1024 and "gzip" in self.headers.get("Accept-Encoding", ""):
+                body = gzip.compress(body)
+                extra["Content-Encoding"] = "gzip"
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            for k, v in (extra or {}).items():
+            for k, v in extra.items():
                 self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
@@ -1988,24 +2054,10 @@ def make_handler(args, dataset: Dataset, clips):
             if route == "/api/public-eval":
                 # No sign-in and no per-result picker: a public visitor sees whatever an
                 # approver pinned, or that nothing has been pinned yet.
-                try:
-                    pid = RESULTS.get_public_id()
-                    body = RESULTS.get(pid) if pid else None
-                except Exception:
-                    pid, body = None, None
-                if not pid or body is None:
-                    return self.send(200, b'{"has_public":false}', "application/json; charset=utf-8")
-                try:
-                    result = json.loads(body)
-                except ValueError:
-                    return self.send(200, b'{"has_public":false}', "application/json; charset=utf-8")
-                # clip_data stays in: it is what lets a public visitor open a clip from the
-                # per-clip table (evalLanes() reads it), and /api/audio + /api/clip-marks
-                # serve it to anyone regardless.
+                payload = RESULTS.get_public_payload()
                 return self.send(
                     200,
-                    json.dumps({"has_public": True, "id": pid, "result": result},
-                               ensure_ascii=False).encode("utf-8"),
+                    payload,
                     "application/json; charset=utf-8",
                     {"Cache-Control": "public, max-age=60"},
                 )
