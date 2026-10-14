@@ -157,13 +157,36 @@ function renderEval(d,prefix,interactive){
     const lo=unit==='%'?ci[0]:Math.round(ci[0]), hi=unit==='%'?ci[1]:Math.round(ci[1]);
     return main+'<span class="evCi">'+lo+'&ndash;'+hi+'</span>';
   };
+  const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
   const TOL=[10,25,50,100];
   const row=(name,s,cls)=>{
+    s=s||{};
     const ci=s.ci||{}, e=s.ends||{};
     const seedTag=(d.seed&&name===d.seed)?'<span class="evSeed">marks started here &mdash; flattered</span>':'';
-    const desc=((d.aligner_status||{})[name]||{}).description||ALIGNER_DESC[name];
-    return '<tr class="'+cls+'"><td><span class="evName">'+name+'</span>'
-      +(desc?'<span class="evDesc">'+desc+'</span>':'')+seedTag+'</td>'
+    const st=(d.aligner_status||{})[name]||{};
+    const rawDesc=s.description||st.description;
+    const desc=rawDesc?esc(rawDesc):ALIGNER_DESC[name];
+    const modelLink=s.model_link||st.model_link;
+    const githubLink=s.github_link||st.github_link;
+    const license=s.license||st.license;
+
+    const links=[];
+    if(modelLink && githubLink && modelLink===githubLink){
+      links.push('<a class="evLink" href="'+esc(githubLink)+'" target="_blank" rel="noopener noreferrer">github &#8599;</a>');
+    }else{
+      if(modelLink) links.push('<a class="evLink" href="'+esc(modelLink)+'" target="_blank" rel="noopener noreferrer">model &#8599;</a>');
+      if(githubLink) links.push('<a class="evLink" href="'+esc(githubLink)+'" target="_blank" rel="noopener noreferrer">github &#8599;</a>');
+    }
+    const licBadge=license?'<span class="evLicense" title="License: '+esc(license)+'">'+esc(license)+'</span>':'';
+    const linksHtml=links.length?'<div class="evLinks">'+links.join('')+'</div>':'';
+
+    return '<tr class="'+cls+'"><td><div class="evAlignerHead"><span class="evName">'+esc(name)+'</span>'
+      +licBadge+'</div>'
+      +(desc?'<span class="evDesc">'+desc+'</span>':'')
+      +linksHtml
+      +seedTag+'</td>'
       +'<td class="'+errClass(s.median_ms)+'">'+withCi(s.median_ms,ci.median_ms,'ms')+'</td>'
       +'<td class="'+errClass(s.p90_ms)+'">'+withCi(s.p90_ms,ci.p90_ms,'ms')+'</td>'
       +TOL.map(x=>'<td>'+withCi(s['within_'+x+'ms'],ci['within_'+x+'ms'],'%')+'</td>').join('')

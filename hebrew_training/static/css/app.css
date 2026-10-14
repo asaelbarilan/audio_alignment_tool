@@ -165,6 +165,13 @@
   table.ev tr.best td:first-child{color:#4ec98a;font-weight:600}
   table.ev tr.floor td{color:#8a8f98;font-style:italic;border-top:1px dashed #3a3f4a}
   .evName{font-weight:600}
+  .evAlignerHead{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .evLicense{display:inline-block;padding:1px 5px;font-size:10px;font-weight:500;border-radius:3px;
+             background:#232730;color:#9aa1ad;border:1px solid #333842;line-height:1.2;
+             font-variant-numeric:normal;letter-spacing:0.2px}
+  .evLinks{display:flex;gap:8px;margin-top:3px;font-size:11px}
+  .evLink{color:#6aa0ff;text-decoration:none}
+  .evLink:hover{text-decoration:underline}
   .evDesc{display:block;color:#6f757f;font-size:11.5px;font-weight:400}
   .evGood{color:#4ec98a}.evMid{color:#d8a13a}.evBad{color:#e06c6c}
   .evBars{display:flex;flex-direction:column;gap:9px;margin-top:4px}
